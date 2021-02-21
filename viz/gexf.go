@@ -16,14 +16,10 @@ const (
 	xmlNSVIZ string = "http://www.gephi.org/gexf/viz"
 
 	classNode string = "node"
-	classEdge string = "edge"
 
-	modeStatic  string = "static"
-	modeDynamic string = "dynamic"
+	modeStatic string = "static"
 
-	edgeTypeDirected   string = "directed"
-	edgeTypeUndirected string = "undirected"
-	edgeTypeMutual     string = "mutual"
+	edgeTypeDirected string = "directed"
 )
 
 type gexfAttrValue struct {
@@ -106,10 +102,12 @@ var (
 )
 
 // WriteGEXFData generates a GEXF file to display the Amass graph using Gephi.
-func WriteGEXFData(output io.Writer, nodes []Node, edges []Edge) {
+func WriteGEXFData(output io.Writer, nodes []Node, edges []Edge) error {
 	bufwr := bufio.NewWriter(output)
 
-	bufwr.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+	if _, err := bufwr.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"); err != nil {
+		return err
+	}
 	bufwr.Flush()
 
 	doc := &gexf{
@@ -183,6 +181,6 @@ func WriteGEXFData(output io.Writer, nodes []Node, edges []Edge) {
 
 	enc := xml.NewEncoder(bufwr)
 	enc.Indent("  ", "    ")
-	enc.Encode(doc)
-	bufwr.Flush()
+	defer bufwr.Flush()
+	return enc.Encode(doc)
 }

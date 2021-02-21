@@ -4,261 +4,179 @@
 package graph
 
 import (
-	"math/rand"
+	"context"
 	"net"
-	"strconv"
 
-	"github.com/OWASP/Amass/v3/graphdb"
 	amassnet "github.com/OWASP/Amass/v3/net"
 	"github.com/OWASP/Amass/v3/requests"
-	"github.com/OWASP/Amass/v3/semaphore"
 	"github.com/OWASP/Amass/v3/stringfilter"
+	"github.com/caffix/stringset"
+	"github.com/cayleygraph/cayley"
+	"github.com/cayleygraph/quad"
 	"golang.org/x/net/publicsuffix"
 )
 
 // EventOutput returns findings within the receiver Graph for the event identified by the uuid string
-// parameter and not already in the filter StringFilter argument. The cache ASNCache argument provides
-// ASN / netblock information already discovered so the routine can avoid unnecessary queries to the
-// graph database. The filter and cache objects are updated by EventOutput.
-func (g *Graph) EventOutput(uuid string, filter stringfilter.Filter, cache *amassnet.ASNCache) []*requests.Output {
-	var results []*requests.Output
-
-	names := g.getEventNameNodes(uuid)
-	if len(names) == 0 {
-		return results
-	}
-
+// parameter and not already in the filter StringFilter argument. The filter is updated by EventOutput.
+func (g *Graph) EventOutput(uuid string, filter stringfilter.Filter, asninfo bool, cache *amassnet.ASNCache) []*requests.Output {
 	// Make sure a filter has been created
 	if filter == nil {
 		filter = stringfilter.NewStringFilter()
 	}
 
-	// Make sure a cache has been created for performance purposes
-	if cache == nil {
-		cache = amassnet.NewASNCache()
+	var names []string
+	for _, name := range g.EventFQDNs(uuid) {
+		if !filter.Has(name) {
+			names = append(names, name)
+		}
 	}
 
-	var count int
-	sem := semaphore.NewSimpleSemaphore(10)
-	output := make(chan *requests.Output, len(names))
-	for _, name := range names {
-		if n := g.db.NodeToID(name); n == "" || filter.Has(n) {
+	lookup := make(map[string]*requests.Output, len(names))
+	for _, o := range g.buildNameInfo(uuid, names) {
+		lookup[o.Name] = o
+	}
+
+	pairs, err := g.NamesToAddrs(uuid, names...)
+	if err != nil {
+		return nil
+	}
+	// Build the lookup map used to create the final result set
+	for _, p := range pairs {
+		if p.Name == "" || p.Addr == "" {
 			continue
 		}
-
-		sem.Acquire(1)
-		go g.buildOutput(name, uuid, cache, output, sem)
-		count++
-	}
-
-	for i := 0; i < count; i++ {
-		if o := <-output; o != nil && !filter.Duplicate(o.Name) {
-			results = append(results, o)
+		if o, found := lookup[p.Name]; found {
+			o.Addresses = append(o.Addresses, requests.AddressInfo{Address: net.ParseIP(p.Addr)})
 		}
 	}
 
-	return results
+	output := make([]*requests.Output, 0, len(lookup))
+	if !asninfo || cache == nil {
+		for _, o := range lookup {
+			if !filter.Duplicate(o.Name) {
+				output = append(output, o)
+			}
+		}
+		return output
+	}
+
+	for _, o := range lookup {
+		var newaddrs []requests.AddressInfo
+
+		for _, a := range o.Addresses {
+			i := cache.AddrSearch(a.Address.String())
+			if i == nil {
+				continue
+			}
+
+			_, netblock, _ := net.ParseCIDR(i.Prefix)
+			newaddrs = append(newaddrs, requests.AddressInfo{
+				Address:     a.Address,
+				ASN:         i.ASN,
+				CIDRStr:     i.Prefix,
+				Netblock:    netblock,
+				Description: i.Description,
+			})
+		}
+
+		o.Addresses = newaddrs
+		if len(o.Addresses) > 0 && !filter.Duplicate(o.Name) {
+			output = append(output, o)
+		}
+	}
+
+	return output
 }
 
 // EventNames returns findings within the receiver Graph for the event identified by the uuid string
 // parameter and not already in the filter StringFilter argument. The filter is updated by EventNames.
 func (g *Graph) EventNames(uuid string, filter stringfilter.Filter) []*requests.Output {
-	var results []*requests.Output
-
-	names := g.getEventNameNodes(uuid)
-	if len(names) == 0 {
-		return results
-	}
-
 	// Make sure a filter has been created
 	if filter == nil {
 		filter = stringfilter.NewStringFilter()
 	}
 
-	for _, name := range names {
-		if o := g.buildNameInfo(name, uuid); o != nil && !filter.Duplicate(o.Name) {
+	var names []string
+	for _, name := range g.EventFQDNs(uuid) {
+		if !filter.Has(name) {
+			names = append(names, name)
+		}
+	}
+
+	var results []*requests.Output
+	for _, o := range g.buildNameInfo(uuid, names) {
+		if !filter.Duplicate(o.Name) {
 			results = append(results, o)
 		}
 	}
-
 	return results
 }
 
-func (g *Graph) getEventNameNodes(uuid string) []graphdb.Node {
-	var names []graphdb.Node
+func (g *Graph) buildNameInfo(uuid string, names []string) []*requests.Output {
+	results := make(map[string]*requests.Output, len(names))
 
-	event, err := g.db.ReadNode(uuid, "event")
-	if err != nil {
-		return names
+	var nameVals []quad.Value
+	for _, name := range names {
+		nameVals = append(nameVals, quad.IRI(name))
 	}
 
-	edges, err := g.db.ReadOutEdges(event)
-	if err != nil {
-		return names
-	}
+	g.db.Lock()
+	p := cayley.StartPath(g.db.store, nameVals...).Has(quad.IRI("type"), quad.String("fqdn"))
+	p = p.Tag("name").InWithTags([]string{"predicate"}).Is(quad.IRI(uuid))
+	p.Iterate(context.Background()).TagValues(nil, func(m map[string]quad.Value) {
+		name := valToStr(m["name"])
+		pred := valToStr(m["predicate"])
 
-	for _, edge := range edges {
-		p, err := g.db.ReadProperties(edge.To, "type")
-
-		if err != nil || len(p) == 0 || p[0].Value != "fqdn" {
-			continue
-		}
-
-		names = append(names, edge.To)
-	}
-
-	return names
-}
-
-func (g *Graph) buildOutput(sub graphdb.Node, uuid string,
-	cache *amassnet.ASNCache, c chan *requests.Output, sem semaphore.Semaphore) {
-	defer sem.Release(1)
-
-	output := g.buildNameInfo(sub, uuid)
-	if output == nil {
-		c <- nil
-		return
-	}
-
-	addrs, err := g.NameToAddrs(sub)
-	if err != nil {
-		c <- nil
-		return
-	}
-
-	var num int
-	addrChan := make(chan *requests.AddressInfo, 100)
-	for _, addr := range addrs {
-		if !g.InEventScope(addr, uuid, "DNS") {
-			continue
-		}
-
-		num++
-		go g.buildAddrInfo(addr, uuid, cache, addrChan)
-	}
-
-	for i := 0; i < num; i++ {
-		a := <-addrChan
-
-		if a != nil {
-			output.Addresses = append(output.Addresses, *a)
-		}
-	}
-
-	if len(output.Addresses) == 0 {
-		c <- nil
-		return
-	}
-
-	c <- output
-}
-
-func randomIndex(length int) int {
-	if length == 1 {
-		return 0
-	}
-
-	return rand.Intn(length - 1)
-}
-
-func (g *Graph) buildNameInfo(sub graphdb.Node, uuid string) *requests.Output {
-	substr := g.db.NodeToID(sub)
-
-	sources, err := g.NodeSources(sub, uuid)
-	if err != nil {
-		return nil
-	}
-	src := sources[0]
-
-	domain, err := publicsuffix.EffectiveTLDPlusOne(substr)
-	if err != nil {
-		return nil
-	}
-
-	return &requests.Output{
-		Name:   substr,
-		Domain: domain,
-		Tag:    g.SourceTag(src),
-		Source: src,
-	}
-}
-
-func (g *Graph) buildAddrInfo(addr graphdb.Node, uuid string, cache *amassnet.ASNCache, c chan *requests.AddressInfo) {
-	if !g.InEventScope(addr, uuid, "DNS") {
-		c <- nil
-		return
-	}
-
-	address := g.db.NodeToID(addr)
-	ainfo := &requests.AddressInfo{Address: net.ParseIP(address)}
-	// Check the ASNCache before querying the graph database
-	if a := cache.AddrSearch(address); a != nil {
-		var err error
-
-		_, ainfo.Netblock, err = net.ParseCIDR(a.Prefix)
-		if err == nil && ainfo.Netblock.Contains(ainfo.Address) {
-			ainfo.ASN = a.ASN
-			ainfo.Description = a.Description
-			ainfo.CIDRStr = a.Prefix
-			c <- ainfo
+		if notDataSourceSet.Has(pred) {
 			return
 		}
-	}
-
-	// Get the netblock that contains the IP address
-	edges, err := g.db.ReadInEdges(addr, "contains")
-	if err != nil {
-		c <- nil
-		return
-	}
-
-	var cidr string
-	var cidrNode graphdb.Node
-	for _, edge := range edges {
-		if g.InEventScope(edge.From, uuid, "RIR") {
-			cidrNode = edge.From
-			cidr = g.db.NodeToID(edge.From)
-			break
+		if _, found := results[name]; !found {
+			results[name] = &requests.Output{Name: name}
 		}
-	}
-	if cidr == "" {
-		c <- nil
-		return
-	}
 
-	ainfo.CIDRStr = cidr
-	_, ainfo.Netblock, _ = net.ParseCIDR(cidr)
-
-	// Get the AS information associated with the netblock
-	edges, err = g.db.ReadInEdges(cidrNode, "prefix")
-	if err != nil {
-		c <- nil
-		return
-	}
-
-	var asn string
-	var asNode graphdb.Node
-	for _, edge := range edges {
-		if g.InEventScope(edge.From, uuid, "RIR") {
-			asNode = edge.From
-			asn = g.db.NodeToID(edge.From)
-			break
+		n := append(results[name].Sources, pred)
+		if s := stringset.Deduplicate(n); len(results[name].Sources) < len(s) {
+			results[name].Sources = n
 		}
-	}
-	if asn == "" {
-		c <- nil
-		return
-	}
-
-	ainfo.ASN, _ = strconv.Atoi(asn)
-	ainfo.Description = g.nodeDescription(asNode)
-
-	cache.Update(&requests.ASNRequest{
-		Address:     ainfo.Address.String(),
-		ASN:         ainfo.ASN,
-		Prefix:      ainfo.CIDRStr,
-		Description: ainfo.Description,
 	})
+	g.db.Unlock()
 
-	c <- ainfo
+	var final []*requests.Output
+	sourceTags := make(map[string]string)
+	for _, o := range results {
+		domain, err := publicsuffix.EffectiveTLDPlusOne(o.Name)
+		if err != nil {
+			continue
+		}
+		o.Domain = domain
+
+		if len(o.Sources) == 0 {
+			continue
+		}
+		o.Tag = g.selectTag(o.Sources, sourceTags)
+
+		final = append(final, o)
+	}
+	return final
+}
+
+func (g *Graph) selectTag(sources []string, sourceTags map[string]string) string {
+	var source, tag string
+
+	for _, src := range sources {
+		var found bool
+
+		source = src
+		tag, found = sourceTags[source]
+		if !found {
+			tag = g.SourceTag(source)
+			sourceTags[source] = tag
+		}
+
+		if requests.TrustedTag(tag) {
+			break
+		}
+	}
+
+	return tag
 }

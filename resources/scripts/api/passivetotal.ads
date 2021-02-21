@@ -10,33 +10,53 @@ function start()
     setratelimit(5)
 end
 
+function check()
+    local c
+    local cfg = datasrc_config()
+    if cfg ~= nil then
+        c = cfg.credentials
+    end
+
+    if (c ~= nil and c.key ~= nil and 
+        c.username ~= nil and c.key ~= "" and c.username ~= "") then
+        return true
+    end
+    return false
+end
+
 function vertical(ctx, domain)
-    if (api == nil or api.key == nil or api.key == "" or 
-        api.username == nil or api.username == "") then
+    local c
+    local cfg = datasrc_config()
+    if cfg ~= nil then
+        c = cfg.credentials
+    end
+
+    if (c == nil or c.key == nil or c.key == "" or 
+        c.username == nil or c.username == "") then
         return
     end
 
     local resp
     local vurl = buildurl(domain)
     -- Check if the response data is in the graph database
-    if (api.ttl ~= nil and api.ttl > 0) then
-        resp = obtain_response(vurl, api.ttl)
+    if (cfg.ttl ~= nil and cfg.ttl > 0) then
+        resp = obtain_response(domain, cfg.ttl)
     end
 
     if (resp == nil or resp == "") then
         local err
 
-        resp, err = request({
+        resp, err = request(ctx, {
             url=vurl,
             headers={['Content-Type']="application/json"},
-            id=api.username,
-            pass=api.key,
+            id=c.username,
+            pass=c.key,
         })
         if (err ~= nil and err ~= "") then
             return
         end
 
-        if (api.ttl ~= nil and api.ttl > 0) then
+        if (cfg.ttl ~= nil and cfg.ttl > 0) then
             cache_response(vurl, resp)
         end
     end
@@ -61,7 +81,11 @@ function sendnames(ctx, content)
         return
     end
 
+    local found = {}
     for i, v in pairs(names) do
-        newname(ctx, v)
+        if found[v] == nil then
+            newname(ctx, v)
+            found[v] = true
+        end
     end
 end

@@ -33,11 +33,11 @@ func TestAddDomains(t *testing.T) {
 	c := NewConfig()
 	example := "owasp.org/test"
 	list := []string{"owasp.org", "google.com", "yahoo.com"}
-	c.AddDomains(list)
+	c.AddDomains(list...)
 	got := c.Domains()
 	sort.Strings(list)
 	sort.Strings(got)
-	c.AddDomains(list)
+	c.AddDomains(list...)
 
 	if !reflect.DeepEqual(list, got) {
 		t.Errorf("Domains do not match.\nWanted:%v\nGot:%v\n", list, got)
@@ -101,28 +101,6 @@ func TestBlacklist(t *testing.T) {
 	if got != want {
 		t.Errorf("Failed to find %v in blacklist.", example)
 	}
-}
-
-func TestAddAPIKey(t *testing.T) {
-	ak := &APIKey{
-		Username: "TestUser",
-		Password: "TestPassword",
-		Key:      "TestKey",
-		Secret:   "TestSecret",
-	}
-	source := "TestSource"
-	c := NewConfig()
-	c.AddAPIKey(source, ak)
-	if c.apikeys == nil {
-		t.Errorf("Failed to add test api key.\nGot%v\nWant:%v", c.apikeys, ak)
-	}
-	t.Run("Testing GetAPIKey...", func(t *testing.T) {
-		got := c.GetAPIKey(source)
-		want := ak
-		if !reflect.DeepEqual(got, want) {
-			t.Errorf("Obtained incorrect key for source:%v\nWant:%v\nGot:%v", source, want, got)
-		}
-	})
 }
 
 func TestLoadSettings(t *testing.T) {

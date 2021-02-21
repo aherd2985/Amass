@@ -6,26 +6,27 @@ package datasrcs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/eventbus"
 	"github.com/OWASP/Amass/v3/net/http"
 	"github.com/OWASP/Amass/v3/requests"
 	"github.com/OWASP/Amass/v3/systems"
+	"github.com/caffix/eventbus"
+	"github.com/caffix/service"
 	"github.com/dghubble/go-twitter/twitter"
 	"golang.org/x/oauth2"
 )
 
 // Twitter is the Service that handles access to the Twitter data source.
 type Twitter struct {
-	requests.BaseService
+	service.BaseService
 
-	API        *config.APIKey
 	SourceType string
 	sys        systems.System
+	creds      *config.Credentials
 	client     *twitter.Client
 }
 
@@ -36,21 +37,20 @@ func NewTwitter(sys systems.System) *Twitter {
 		sys:        sys,
 	}
 
-	t.BaseService = *requests.NewBaseService(t, "Twitter")
+	t.BaseService = *service.NewBaseService(t, "Twitter")
 	return t
 }
 
-// Type implements the Service interface.
-func (t *Twitter) Type() string {
+// Description implements the Service interface.
+func (t *Twitter) Description() string {
 	return t.SourceType
 }
 
 // OnStart implements the Service interface.
 func (t *Twitter) OnStart() error {
-	t.BaseService.OnStart()
+	t.creds = t.sys.Config().GetDataSourceConfig(t.String()).GetCredentials()
 
-	t.API = t.sys.Config().GetAPIKey(t.String())
-	if t.API == nil || t.API.Key == "" || t.API.Secret == "" {
+	if t.creds == nil || t.creds.Key == "" || t.creds.Secret == "" {
 		t.sys.Config().Log.Printf("%s: API key data was not provided", t.String())
 	} else {
 		if bearer, err := t.getBearerToken(); err == nil {
@@ -63,15 +63,33 @@ func (t *Twitter) OnStart() error {
 		}
 	}
 
-	t.SetRateLimit(3 * time.Second)
+	t.SetRateLimit(1)
+	return t.checkConfig()
+}
+
+// CheckConfig implements the Service interface.
+func (t *Twitter) checkConfig() error {
+	creds := t.sys.Config().GetDataSourceConfig(t.String()).GetCredentials()
+
+	if creds == nil || creds.Key == "" || creds.Secret == "" {
+		estr := fmt.Sprintf("%s: check callback failed for the configuration", t.String())
+		t.sys.Config().Log.Print(estr)
+		return errors.New(estr)
+	}
+
 	return nil
 }
 
-// OnDNSRequest implements the Service interface.
-func (t *Twitter) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
-	cfg := ctx.Value(requests.ContextConfig).(*config.Config)
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if cfg == nil || bus == nil {
+// OnRequest implements the Service interface.
+func (t *Twitter) OnRequest(ctx context.Context, args service.Args) {
+	if req, ok := args.(*requests.DNSRequest); ok {
+		t.dnsRequest(ctx, req)
+	}
+}
+
+func (t *Twitter) dnsRequest(ctx context.Context, req *requests.DNSRequest) {
+	cfg, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
 
@@ -80,8 +98,7 @@ func (t *Twitter) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
 		return
 	}
 
-	t.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, t.String())
+	numRateLimitChecks(t, 2)
 	bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 		fmt.Sprintf("Querying %s for %s subdomains", t.String(), req.Domain))
 
@@ -99,33 +116,25 @@ func (t *Twitter) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
 		// URLs in the tweet body
 		for _, urlEntity := range tweet.Entities.Urls {
 			for _, name := range re.FindAllString(urlEntity.ExpandedURL, -1) {
-				bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
-					Name:   name,
-					Domain: req.Domain,
-					Tag:    t.SourceType,
-					Source: t.String(),
-				})
+				genNewNameEvent(ctx, t.sys, t, name)
 			}
 		}
 
 		// Source of the tweet
 		for _, name := range re.FindAllString(tweet.Source, -1) {
-			bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
-				Name:   name,
-				Domain: req.Domain,
-				Tag:    t.SourceType,
-				Source: t.String(),
-			})
+			genNewNameEvent(ctx, t.sys, t, name)
 		}
 	}
 }
 
 func (t *Twitter) getBearerToken() (string, error) {
 	headers := map[string]string{"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"}
-	page, err := http.RequestWebPage(
-		"https://api.twitter.com/oauth2/token",
-		strings.NewReader("grant_type=client_credentials"),
-		headers, t.API.Key, t.API.Secret)
+	page, err := http.RequestWebPage(context.Background(), "https://api.twitter.com/oauth2/token",
+		strings.NewReader("grant_type=client_credentials"), headers,
+		&http.BasicAuth{
+			Username: t.creds.Key,
+			Password: t.creds.Secret,
+		})
 	if err != nil {
 		return "", fmt.Errorf("token request failed: %+v", err)
 	}

@@ -5,17 +5,13 @@ name = "Wayback"
 type = "archive"
 
 function start()
-    setratelimit(1)
+    setratelimit(5)
 end
 
 function vertical(ctx, domain)
-    crawl(ctx, buildurl(domain))
-end
-
-function resolved(ctx, name, domain, records)
-    crawl(ctx, buildurl(name))
+    scrape(ctx, {['url']=buildurl(domain)})
 end
 
 function buildurl(domain)
-    return "http://web.archive.org/web/" .. os.date("%Y") .. "/" .. domain
+    return "https://web.archive.org/cdx/search/cdx?matchType=domain&fl=original&output=json&collapse=urlkey&url=" .. domain
 end

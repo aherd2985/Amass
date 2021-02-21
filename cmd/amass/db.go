@@ -5,22 +5,19 @@ package main
 
 import (
 	"bytes"
-	"errors"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
-	"sort"
-	"strings"
-	"time"
 
 	"github.com/OWASP/Amass/v3/config"
 	"github.com/OWASP/Amass/v3/format"
 	"github.com/OWASP/Amass/v3/graph"
-	"github.com/OWASP/Amass/v3/graphdb"
+	"github.com/OWASP/Amass/v3/net"
 	"github.com/OWASP/Amass/v3/requests"
-	"github.com/OWASP/Amass/v3/stringfilter"
-	"github.com/OWASP/Amass/v3/stringset"
+	"github.com/caffix/stringset"
 	"github.com/fatih/color"
 )
 
@@ -48,6 +45,8 @@ type dbArgs struct {
 		ConfigFile string
 		Directory  string
 		Domains    string
+		JSONOutput string
+		TermOut    string
 	}
 }
 
@@ -58,7 +57,6 @@ func runDBCommand(clArgs []string) {
 
 	dbBuf := new(bytes.Buffer)
 	dbCommand.SetOutput(dbBuf)
-
 	args.Domains = stringset.New()
 
 	dbCommand.BoolVar(&help1, "h", false, "Show the program usage message")
@@ -79,12 +77,13 @@ func runDBCommand(clArgs []string) {
 	dbCommand.StringVar(&args.Filepaths.ConfigFile, "config", "", "Path to the INI configuration file. Additional details below")
 	dbCommand.StringVar(&args.Filepaths.Directory, "dir", "", "Path to the directory containing the graph database")
 	dbCommand.StringVar(&args.Filepaths.Domains, "df", "", "Path to a file providing root domain names")
+	dbCommand.StringVar(&args.Filepaths.JSONOutput, "json", "", "Path to the JSON output file")
+	dbCommand.StringVar(&args.Filepaths.TermOut, "o", "", "Path to the text file containing terminal stdout/stderr")
 
 	if len(clArgs) < 1 {
 		commandUsage(dbUsageMsg, dbCommand, dbBuf)
 		return
 	}
-
 	if err := dbCommand.Parse(clArgs); err != nil {
 		r.Fprintf(color.Error, "%v\n", err)
 		os.Exit(1)
@@ -93,7 +92,6 @@ func runDBCommand(clArgs []string) {
 		commandUsage(dbUsageMsg, dbCommand, dbBuf)
 		return
 	}
-
 	if args.Options.NoColor {
 		color.NoColor = true
 	}
@@ -101,7 +99,6 @@ func runDBCommand(clArgs []string) {
 		color.Output = ioutil.Discard
 		color.Error = ioutil.Discard
 	}
-
 	if args.Filepaths.Domains != "" {
 		list, err := config.GetListFromFile(args.Filepaths.Domains)
 		if err != nil {
@@ -111,7 +108,7 @@ func runDBCommand(clArgs []string) {
 		args.Domains.InsertMany(list...)
 	}
 
-	cfg := new(config.Config)
+	cfg := config.NewConfig()
 	// Check if a configuration file was provided, and if so, load the settings
 	if err := config.AcquireConfig(args.Filepaths.Directory, args.Filepaths.ConfigFile, cfg); err == nil {
 		if args.Filepaths.Directory == "" {
@@ -132,231 +129,220 @@ func runDBCommand(clArgs []string) {
 	}
 	defer db.Close()
 
-	if args.Options.ListEnumerations {
-		listEvents(&args, db)
-		return
-	}
-
-	if args.Options.ShowAll {
-		args.Options.DiscoveredNames = true
-		args.Options.ASNTableSummary = true
-	}
-
-	if !args.Options.DiscoveredNames && !args.Options.ASNTableSummary {
-		commandUsage(dbUsageMsg, dbCommand, dbBuf)
-		return
-	}
-
-	// Get all the UUIDs for events that have information in scope
-	uuids := eventUUIDs(args.Domains.Slice(), db)
-	if len(uuids) == 0 {
-		r.Fprintln(color.Error, "Failed to find the domains of interest in the database")
-		os.Exit(1)
-	}
-
-	// Put the events in chronological order
-	uuids, _, _ = orderedEvents(uuids, db)
-	if len(uuids) == 0 {
-		r.Fprintln(color.Error, "Failed to sort the events")
-		os.Exit(1)
-	}
-
-	// Select the enumeration that the user specified
-	if args.Enum > 0 && len(uuids) > args.Enum {
-		uuids = []string{uuids[args.Enum]}
-	}
-
-	// Create the in-memory graph database
-	memDB, err := memGraphForEvents(uuids, db)
+	// Create the in-memory graph database for events that have information in scope
+	memDB, err := memGraphForScope(args.Domains.Slice(), db)
 	if err != nil {
 		r.Fprintln(color.Error, err.Error())
 		os.Exit(1)
 	}
-
-	showEventData(&args, uuids, memDB)
-}
-
-func openGraphDatabase(dir string, cfg *config.Config) *graph.Graph {
-	// Attempt to connect to a Gremlin Amass graph database
-	if cfg.GremlinURL != "" {
-		gremlin := graphdb.NewGremlin(cfg.GremlinURL, cfg.GremlinUser, cfg.GremlinPass)
-
-		if gremlin != nil {
-			if g := graph.NewGraph(gremlin); g != nil {
-				return g
-			}
-		}
+	// Get all the UUIDs for events that have information in scope
+	uuids := memDB.EventList()
+	if len(uuids) == 0 {
+		r.Fprintln(color.Error, "Failed to find the domains of interest in the database")
+		os.Exit(1)
 	}
-
-	// Check that the graph database directory exists
-	if d := config.OutputDirectory(dir); d != "" {
-		if finfo, err := os.Stat(d); !os.IsNotExist(err) && finfo.IsDir() {
-			if g := graph.NewGraph(graphdb.NewCayleyGraph(d, false)); g != nil {
-				return g
-			}
-		}
-	}
-
-	return nil
-}
-
-func listEvents(args *dbArgs, db *graph.Graph) {
-	domains := args.Domains.Slice()
-	events := eventUUIDs(domains, db)
-
-	if len(events) == 0 {
-		r.Fprintln(color.Error, "No enumerations found within the provided scope")
+	if args.Options.ListEnumerations {
+		listEvents(uuids, memDB)
 		return
 	}
+	if args.Options.ShowAll || args.Filepaths.JSONOutput != "" {
+		args.Options.DiscoveredNames = true
+		args.Options.ASNTableSummary = true
+	}
+	if !args.Options.DiscoveredNames && !args.Options.ASNTableSummary {
+		commandUsage(dbUsageMsg, dbCommand, dbBuf)
+		return
+	}
+	// Put the events in chronological order
+	uuids, _, _ = orderedEvents(uuids, memDB)
+	if len(uuids) == 0 {
+		r.Fprintln(color.Error, "Failed to sort the events")
+		os.Exit(1)
+	}
+	// Select the enumeration that the user specified
+	if args.Enum > 0 && len(uuids) >= args.Enum {
+		idx := len(uuids) - args.Enum
 
-	events, earliest, latest := orderedEvents(events, db)
+		uuids = []string{uuids[idx]}
+	}
+
+	var asninfo bool
+	if args.Options.ASNTableSummary {
+		asninfo = true
+	}
+
+	showEventData(&args, uuids, asninfo, memDB)
+}
+
+func listEvents(uuids []string, db *graph.Graph) {
+	events, earliest, latest := orderedEvents(uuids, db)
 	// Check if the user has requested the list of enumerations
-	for i := range events {
-		if i != 0 {
+	for pos, idx := 0, len(events)-1; idx >= 0; idx-- {
+		if pos != 0 {
 			g.Println()
 		}
 
-		g.Printf("%d) %s -> %s: ", i+1, earliest[i].Format(timeFormat), latest[i].Format(timeFormat))
+		g.Printf("%d) %s -> %s: ", pos+1, earliest[idx].Format(timeFormat), latest[idx].Format(timeFormat))
 		// Print out the scope for this enumeration
-		for x, domain := range db.EventDomains(events[i]) {
+		for x, domain := range db.EventDomains(events[idx]) {
 			if x != 0 {
 				g.Print(", ")
 			}
 			g.Print(domain)
 		}
 		g.Println()
+		pos++
 	}
 }
 
-func memGraphForEvents(uuids []string, from *graph.Graph) (*graph.Graph, error) {
-	db := graph.NewGraph(graphdb.NewCayleyGraphMemory())
-	if db == nil {
-		return nil, errors.New("Failed to create the in-memory graph database")
-	}
-
-	// Migrate the event data into the in-memory graph database
-	if err := migrateAllEvents(uuids, from, db); err != nil {
-		return nil, fmt.Errorf("Failed to move the data into the in-memory graph database: %v", err)
-	}
-
-	return db, nil
-}
-
-func orderedEvents(events []string, db *graph.Graph) ([]string, []time.Time, []time.Time) {
-	sort.Slice(events, func(i, j int) bool {
-		var less bool
-
-		e1, l1 := db.EventDateRange(events[i])
-		e2, l2 := db.EventDateRange(events[j])
-		if l1.After(l2) || e2.Before(e1) {
-			less = true
-		}
-		return less
-	})
-
-	var earliest, latest []time.Time
-	for _, event := range events {
-		e, l := db.EventDateRange(event)
-
-		earliest = append(earliest, e)
-		latest = append(latest, l)
-	}
-
-	return events, earliest, latest
-}
-
-// Obtain the enumeration IDs that include the provided domain
-func eventUUIDs(domains []string, db *graph.Graph) []string {
-	var uuids []string
-
-	for _, id := range db.EventList() {
-		if len(domains) == 0 {
-			uuids = append(uuids, id)
-			continue
-		}
-
-		surface := db.EventDomains(id)
-		for _, domain := range domains {
-			if domainNameInScope(domain, surface) {
-				uuids = append(uuids, id)
-				break
-			}
-		}
-	}
-
-	return uuids
-}
-
-func migrateAllEvents(uuids []string, from, to *graph.Graph) error {
-	for _, uuid := range uuids {
-		if err := from.MigrateEvent(uuid, to); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func showEventData(args *dbArgs, uuids []string, db *graph.Graph) {
+func showEventData(args *dbArgs, uuids []string, asninfo bool, db *graph.Graph) {
 	var total int
+	var err error
+	var outfile *os.File
+	var discovered []*requests.Output
 	domains := args.Domains.Slice()
+
+	if args.Filepaths.TermOut != "" {
+		outfile, err = os.OpenFile(args.Filepaths.TermOut, os.O_WRONLY|os.O_CREATE, 0644)
+		if err != nil {
+			r.Fprintf(color.Error, "Failed to open the text output file: %v\n", err)
+			os.Exit(1)
+		}
+		defer func() {
+			outfile.Sync()
+			outfile.Close()
+		}()
+		outfile.Truncate(0)
+		outfile.Seek(0, 0)
+	}
+
+	var cache *net.ASNCache
+	if asninfo {
+		cache = net.NewASNCache()
+		db.ASNCacheFill(cache)
+	}
 
 	tags := make(map[string]int)
 	asns := make(map[int]*format.ASNSummaryData)
-	for _, out := range getEventOutput(uuids, db) {
+	for _, out := range getEventOutput(uuids, asninfo, db, cache) {
 		if len(domains) > 0 && !domainNameInScope(out.Name, domains) {
 			continue
 		}
 
 		out.Addresses = format.DesiredAddrTypes(out.Addresses, args.Options.IPv4, args.Options.IPv6)
-		if len(out.Addresses) == 0 {
+		if l := len(out.Addresses); (args.Options.IPs || args.Options.IPv4 || args.Options.IPv6) && l == 0 {
 			continue
+		} else if l > 0 {
+			total++
+			format.UpdateSummaryData(out, tags, asns)
 		}
 
-		total++
-		format.UpdateSummaryData(out, tags, asns)
 		source, name, ips := format.OutputLineParts(out, args.Options.Sources,
 			args.Options.IPs || args.Options.IPv4 || args.Options.IPv6, args.Options.DemoMode)
-
 		if ips != "" {
 			ips = " " + ips
 		}
 
 		if args.Options.DiscoveredNames {
-			fmt.Fprintf(color.Output, "%s%s%s\n", blue(source), green(name), yellow(ips))
+			var written bool
+			if outfile != nil {
+				fmt.Fprintf(outfile, "%s%s%s\n", source, name, ips)
+				written = true
+			}
+			if args.Filepaths.JSONOutput != "" {
+				discovered = append(discovered, out)
+				written = true
+			}
+			if !written {
+				fmt.Fprintf(color.Output, "%s%s%s\n", blue(source), green(name), yellow(ips))
+			}
 		}
 	}
 
 	if total == 0 {
 		r.Println("No names were discovered")
+		return
+	}
+	if args.Filepaths.JSONOutput != "" {
+		writeJSON(args, uuids, discovered, db)
 	} else if args.Options.ASNTableSummary {
-		format.PrintEnumerationSummary(total, tags, asns, args.Options.DemoMode)
+		var out io.Writer
+		status := color.NoColor
+
+		if outfile != nil {
+			out = outfile
+			color.NoColor = true
+		} else if args.Options.ShowAll {
+			out = color.Error
+		} else {
+			out = color.Output
+		}
+
+		format.FprintEnumerationSummary(out, total, tags, asns, args.Options.DemoMode)
+		color.NoColor = status
 	}
 }
 
-func getEventOutput(uuids []string, db *graph.Graph) []*requests.Output {
-	var output []*requests.Output
-	filter := stringfilter.NewStringFilter()
-
-	for i := len(uuids) - 1; i >= 0; i-- {
-		for _, out := range db.EventOutput(uuids[i], filter, nil) {
-			output = append(output, out)
-		}
-	}
-	return output
+type jsonEvent struct {
+	UUID   string `json:"uuid"`
+	Start  string `json:"start"`
+	Finish string `json:"finish"`
 }
 
-func domainNameInScope(name string, scope []string) bool {
-	var discovered bool
+type jsonDomain struct {
+	Domain string             `json:"domain"`
+	Total  int                `json:"total"`
+	Names  []*requests.Output `json:"names"`
+}
 
-	n := strings.ToLower(strings.TrimSpace(name))
-	for _, d := range scope {
-		d = strings.ToLower(d)
+type jsonOutput struct {
+	Events  []*jsonEvent  `json:"events"`
+	Domains []*jsonDomain `json:"domains"`
+}
 
-		if n == d || strings.HasSuffix(n, "."+d) {
-			discovered = true
-			break
-		}
+func writeJSON(args *dbArgs, uuids []string, assets []*requests.Output, db *graph.Graph) {
+	var output jsonOutput
+
+	// Add the event data to the JSON
+	events, earliest, latest := orderedEvents(uuids, db)
+	for i, uuid := range events {
+		output.Events = append(output.Events, &jsonEvent{
+			UUID:   uuid,
+			Start:  earliest[i].Format(timeFormat),
+			Finish: latest[i].Format(timeFormat),
+		})
 	}
-	return discovered
+	// Add the asset specific data
+	for _, asset := range assets {
+		var found bool
+		var d *jsonDomain
+
+		for _, domain := range output.Domains {
+			if domain.Domain == asset.Domain {
+				found = true
+				d = domain
+				break
+			}
+		}
+		if !found {
+			d = &jsonDomain{Domain: asset.Domain}
+
+			output.Domains = append(output.Domains, d)
+		}
+
+		d.Total++
+		d.Names = append(d.Names, asset)
+	}
+
+	jsonptr, err := os.OpenFile(args.Filepaths.JSONOutput, os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		r.Fprintf(color.Error, "Failed to open the JSON output file: %v\n", err)
+		return
+	}
+	// Remove previously stored data and encode the JSON
+	jsonptr.Truncate(0)
+	jsonptr.Seek(0, 0)
+	json.NewEncoder(jsonptr).Encode(output)
+	jsonptr.Sync()
+	jsonptr.Close()
 }

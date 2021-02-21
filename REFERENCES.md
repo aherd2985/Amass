@@ -38,6 +38,10 @@ Did you write a blog post, magazine article or do a podcast about or mentioning 
 
 ### Blogs & Articles
 
+* Article on [ThreadFix](threadfix.it):
+  * [Applied ThreadFix: Seeding Your Application Portfolio with OWASP Amass](https://threadfix.it/resources/applied-threadfix-seeding-your-application-portfolio-with-owasp-amass/)
+* Blog post on [Luke Stephens' (@hakluke)](https://medium.com/@hakluke):
+  * [Hakluke’s Guide to Amass — How to Use Amass More Effectively for Bug Bounties](https://medium.com/@hakluke/haklukes-guide-to-amass-how-to-use-amass-more-effectively-for-bug-bounties-7c37570b83f7)
 * Blog post on [WW Tech Blog](https://medium.com/ww-tech-blog):
   * [Reducing Our Attack Surface with AppSec Platform](https://medium.com/ww-tech-blog/reducing-our-attack-surface-with-appsec-platform-4b6717a16709)
 * Blog post on [SecurityTrail's Blog](https://securitytrails.com/blog/):
@@ -123,6 +127,8 @@ Did you write a blog post, magazine article or do a podcast about or mentioning 
   * [Subdomain Enumeration Tools – 2019 Update](https://www.yeahhub.com/subdomain-enumeration-tools-2019-update/)
 * Blog post on [Jonathan Bouman's Blog](https://medium.com/@jonathanbouman):
   * [Leaked Salesforce API access token at IDEA.com](https://medium.com/@jonathanbouman/leaked-salesforce-api-access-token-at-ikea-com-132eea3844e0)
+* Blog post on [Drafting my Thoughts](https://foremandrafts.github.io/):
+  * [Initial Reconaissance for Bug-Bounty](https://foremandrafts.github.io/posts/2019-3-30-hackerrecon)
 * Blog post on [Shankar R's Blog](https://blog.usejournal.com/@trapp3rhat):
   * [Bug Hunting Methodology (part-1)](https://blog.usejournal.com/bug-hunting-methodology-part-1-91295b2d2066)
 * Blog post on [bit3code's Blog](https://sylarsec.com/author/bit3code):
@@ -148,6 +154,10 @@ Did you write a blog post, magazine article or do a podcast about or mentioning 
 
 ## Lectures and Trainings
 
+* [OWASP Amass Boot Camp Training](https://www.youtube.com/c/RedTeamVillage/featured)
+  by Jeff Foley,
+  [DEF CON 28 Red Team Village](https://redteamvillage.io/),
+  07.08.2020
 * [OWASP Portland Training Day](https://wiki.owasp.org/index.php/OWASP_Portland_2019_Training_Day):
   * [OWASP Amass: Discovering Your Exposure on the Internet](https://wiki.owasp.org/index.php/OWASP_Portland_2019_Training_Day)
 * [Blackhat Trainings](https://www.blackhat.com/trainings/):
@@ -155,6 +165,10 @@ Did you write a blog post, magazine article or do a podcast about or mentioning 
 
 ## Summits & Open Source Events
 
+* [OWASP Amass Boot Camp](https://www.youtube.com/watch?v=J33JmuQ79tE&t=4s)
+  by Jeff Foley,
+  GrayHat 2020,
+  30.10.2020
 * [OWASP Amass Boot Camp](https://www.youtube.com/watch?v=OOurkCPf2-I&list=PLruly0ngXhPGvyl-gOp4d_TvIiedloX1l)
   by Jeff Foley,
   Cyber June'Gle Virtual Summit,
@@ -168,6 +182,10 @@ Did you write a blog post, magazine article or do a podcast about or mentioning 
 
 ### 2020
 
+* [Organizational Asset Discovery & Recon with OWASP Amass](https://vimeo.com/481985359)
+  by Nick Gkogkos,
+  BSides København 2020,
+  19.09.2020
 * [How to Use Amass Efficiently](https://www.youtube.com/watch?v=H1wdBgY1rtg)
   by Jeff Foley,
   NahamCom 2020,

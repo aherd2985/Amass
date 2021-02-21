@@ -4,25 +4,24 @@
 package enum
 
 import (
-	"strings"
 	"time"
 
-	"github.com/OWASP/Amass/v3/eventbus"
-	"github.com/OWASP/Amass/v3/net/http"
 	"github.com/OWASP/Amass/v3/requests"
 	"github.com/OWASP/Amass/v3/stringfilter"
 )
 
 // ExtractOutput is a convenience method for obtaining new discoveries made by the enumeration process.
-func (e *Enumeration) ExtractOutput(filter stringfilter.Filter) []*requests.Output {
+func (e *Enumeration) ExtractOutput(filter stringfilter.Filter, asinfo bool) []*requests.Output {
 	if e.Config.Passive {
 		return e.Graph.EventNames(e.Config.UUID.String(), filter)
 	}
 
-	return e.Graph.EventOutput(e.Config.UUID.String(), filter, e.netCache)
+	return e.Graph.EventOutput(e.Config.UUID.String(), filter, asinfo, e.Sys.Cache())
 }
 
 func (e *Enumeration) submitKnownNames() {
+	filter := stringfilter.NewStringFilter()
+
 	for _, g := range e.Sys.GraphDatabases() {
 		var events []string
 
@@ -30,18 +29,25 @@ func (e *Enumeration) submitKnownNames() {
 			for _, domain := range g.EventDomains(event) {
 				if e.Config.IsDomainInScope(domain) {
 					events = append(events, event)
+					break
 				}
 			}
 		}
 
 		for _, event := range events {
-			for _, output := range g.EventNames(event, nil) {
+			for _, output := range g.EventNames(event, filter) {
+				select {
+				case <-e.done:
+					return
+				default:
+				}
+
 				if e.Config.IsDomainInScope(output.Name) {
-					e.Bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
+					e.nameSrc.InputName(&requests.DNSRequest{
 						Name:   output.Name,
 						Domain: output.Domain,
 						Tag:    output.Tag,
-						Source: output.Source,
+						Source: output.Sources[0],
 					})
 				}
 			}
@@ -52,27 +58,12 @@ func (e *Enumeration) submitKnownNames() {
 func (e *Enumeration) submitProvidedNames() {
 	for _, name := range e.Config.ProvidedNames {
 		if domain := e.Config.WhichDomain(name); domain != "" {
-			e.Bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
+			e.nameSrc.InputName(&requests.DNSRequest{
 				Name:   name,
 				Domain: domain,
 				Tag:    requests.EXTERNAL,
 				Source: "User Input",
 			})
-		}
-	}
-}
-
-func (e *Enumeration) namesFromCertificates(addr string) {
-	for _, name := range http.PullCertificateNames(addr, e.Config.Ports) {
-		if n := strings.TrimSpace(name); n != "" {
-			if domain := e.Config.WhichDomain(n); domain != "" {
-				e.Bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
-					Name:   n,
-					Domain: domain,
-					Tag:    requests.CERT,
-					Source: "Active Cert",
-				})
-			}
 		}
 	}
 }

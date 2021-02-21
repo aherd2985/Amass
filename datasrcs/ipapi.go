@@ -7,17 +7,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
-	"github.com/OWASP/Amass/v3/eventbus"
 	"github.com/OWASP/Amass/v3/net/http"
 	"github.com/OWASP/Amass/v3/requests"
 	"github.com/OWASP/Amass/v3/systems"
+	"github.com/caffix/eventbus"
+	"github.com/caffix/service"
 )
 
 // IPAPI is the Service that handles access to the ipapi data source.
 type IPAPI struct {
-	requests.BaseService
+	service.BaseService
 
 	SourceType string
 }
@@ -26,27 +26,31 @@ type IPAPI struct {
 func NewIPAPI(sys systems.System) *IPAPI {
 	i := &IPAPI{SourceType: requests.API}
 
-	i.BaseService = *requests.NewBaseService(i, "ipapi")
+	i.BaseService = *service.NewBaseService(i, "ipapi")
 	return i
 }
 
-// Type implements the Service interface.
-func (i *IPAPI) Type() string {
+// Description implements the Service interface.
+func (i *IPAPI) Description() string {
 	return i.SourceType
 }
 
 // OnStart implements the Service interface.
 func (i *IPAPI) OnStart() error {
-	i.BaseService.OnStart()
-
-	i.SetRateLimit(time.Second)
+	i.SetRateLimit(1)
 	return nil
 }
 
-// OnAddrRequest implements the Service interface.
-func (i *IPAPI) OnAddrRequest(ctx context.Context, req *requests.AddrRequest) {
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if bus == nil {
+// OnRequest implements the Service interface.
+func (i *IPAPI) OnRequest(ctx context.Context, args service.Args) {
+	if req, ok := args.(*requests.AddrRequest); ok {
+		i.addrRequest(ctx, req)
+	}
+}
+
+func (i *IPAPI) addrRequest(ctx context.Context, req *requests.AddrRequest) {
+	_, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
 
@@ -54,12 +58,9 @@ func (i *IPAPI) OnAddrRequest(ctx context.Context, req *requests.AddrRequest) {
 		return
 	}
 
-	i.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, i.String())
-
 	url := i.restAddrURL(req.Address)
 	headers := map[string]string{"Content-Type": "application/json"}
-	page, err := http.RequestWebPage(url, nil, headers, "", "")
+	page, err := http.RequestWebPage(ctx, url, nil, headers, nil)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %s: %v", i.String(), url, err))
 		return

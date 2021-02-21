@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"time"
@@ -31,8 +32,8 @@ func main() {
 	}
 	defer e.Close()
 
-	e.Start()
-	for _, o := range e.ExtractOutput(nil) {
+	e.Start(context.TODO())
+	for _, o := range e.ExtractOutput(nil, false) {
 		fmt.Println(o.Name)
 	}
 }

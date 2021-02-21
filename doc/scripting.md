@@ -35,6 +35,7 @@ The `type` field provides the category of the data source implemented by the scr
 | "dns"       | DNS Queries |
 | "axfr"      | DNS Zone Transfers |
 | "scrape"    | Web Scraping |
+| "crawl"     | Web Crawling |
 | "api"       | Various APIs |
 | "cert"      | TLS Certificates |
 | "archive"   | Web Archives |
@@ -143,7 +144,7 @@ The `records` parameter is a table of tables that each contain the following fie
 
 ### `subdomain` Callback
 
-Amass executes the `subdomain` callback function after successfully resolving the provided `name` via DNS query and checking that it is a proper subdomain name. A proper subdomain name must have more labels than the root domain name and be resolved with a hostname label. For example, if `example.com` is the root domain name, and the FQDN `www.depta.example.com` is successfully resolved, then the proper subdomain name `depta.example.com` will be provied to the `subdomain` callback function. The `times` parameter shares how many hostnames have been discovered within this proper subdomain name.
+Amass executes the `subdomain` callback function after successfully resolving the provided `name` via DNS query and checking that it is a proper subdomain name. A proper subdomain name must have more labels than the root domain name and be resolved with a hostname label. For example, if `example.com` is the root domain name, and the FQDN `www.depta.example.com` is successfully resolved, then the proper subdomain name `depta.example.com` will be provided to the `subdomain` callback function. The `times` parameter shares how many hostnames have been discovered within this proper subdomain name.
 
 ```lua
 function subdomain(ctx, name, domain, times)
@@ -180,11 +181,11 @@ end
 
 ### `asn` Callback
 
-Amass executes the `asn` callback function when attempting to obtain autonomous system (AS) information from a provide IP address and IP that is within scope. The function is provided an IP address that is within scope and the script sends back the information for the associated AS using the `newasn` (more about this below) function.
+Amass executes the `asn` callback function when attempting to obtain autonomous system (AS) information from the provided IP address and/or AS number. The function is provided an IP address and/or AS number that is within scope and the script sends back the information for the associated AS using the `newasn` (more about this below) function.
 
 ```lua
-function asn(ctx, addr)
-    -- Send back a related AS information
+function asn(ctx, addr, asn)
+    -- Send back the related AS information
     newasn(ctx, {
         ['addr']=addr,
         ['asn']=tonumber(asn),
@@ -198,6 +199,7 @@ end
 |:-----------|:----------|
 | ctx        | UserData  |
 | addr       | string    |
+| asn        | number    |
 
 ### `config` Function
 
@@ -311,21 +313,6 @@ end
 |:-----------|:----------|
 | ctx        | UserData  |
 | msg        | string    |
-
-### `active` Function
-
-A script can signal the enumeration process of its activity by executing the `active` function. This extends the duration of the enumeration process.
-
-```lua
-function make_request(ctx, fqdn)
-    active(ctx)
-    -- Access the data source to make additional discoveries
-end
-```
-
-| Field Name | Data Type |
-|:-----------|:----------|
-| ctx        | UserData  |
 
 ### `outputdir` Function
 
@@ -450,7 +437,7 @@ The `request` function performs HTTP(s) client requests for Amass data source sc
 ```lua
 function vertical(ctx, domain)
     local url = "https://" .. domain
-    local page, err = request({
+    local page, err = request(ctx, {
         method="POST",
         data=body,
         ['url']=url,
@@ -465,6 +452,13 @@ function vertical(ctx, domain)
     -- Utilize the body provided in the response
 end
 ```
+
+| Field Name | Data Type |
+|:-----------|:----------|
+| ctx        | UserData  |
+| params     | table     |
+
+The `params` table has the following fields:
 
 | Field Name | Data Type |
 |:-----------|:----------|
@@ -500,13 +494,13 @@ end
 
 ### `crawl` Function
 
-The `crawl` function performs HTTP(s) web crawling/spidering for Amass data source scripts. The body of the responses are automatically checked for subdomain names that are in scope of the enumeration process.
+The `crawl` function performs HTTP(s) web crawling/spidering for Amass data source scripts. The body of the responses are automatically checked for subdomain names that are in scope of the enumeration process. The crawler will not follow more than `max` links unless the provided value is `0`.
 
 ```lua
 function vertical(ctx, domain)
     local url = "https://" .. domain
 
-    crawl(ctx, url)
+    crawl(ctx, url, 50)
 end
 ```
 
@@ -514,6 +508,7 @@ end
 |:-----------|:----------|
 | ctx        | UserData  |
 | url        | string    |
+| max        | number    |
 
 ### `newname` Function
 
@@ -570,16 +565,17 @@ end
 
 ### `newasn` Function
 
-The `newasn` function allows Amass data source scripts to submit discovered autonomous system information related to the provided `addr` parameter. The function accepts a table of return values that is defined below.
+The `newasn` function allows Amass data source scripts to submit discovered autonomous system information related to the provided `addr` or `asn` parameters. The function accepts a table of return values that is defined below.
 
 ```lua
-function asn(ctx, addr)
-    -- Send back a related AS information
+function asn(ctx, addr, asn)
+    -- Send back the related AS information
     newasn(ctx, {
         ['addr']=addr,
         ['asn']=tonumber(asn),
-        ['desc']=desc,
         prefix=cidr,
+        ['desc']=desc,
+        ['netblocks']={cidr},
     })
 end
 ```
@@ -588,5 +584,8 @@ end
 |:-----------|:----------|
 | addr       | string    |
 | asn        | number    |
-| desc       | string    |
 | prefix     | string    |
+| cc         | string    |
+| registry   | string    |
+| desc       | string    |
+| netblocks  | table     |

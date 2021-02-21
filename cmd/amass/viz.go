@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/stringset"
 	"github.com/OWASP/Amass/v3/viz"
+	"github.com/caffix/stringset"
 	"github.com/fatih/color"
 )
 
@@ -111,6 +111,7 @@ func runVizCommand(clArgs []string) {
 	rand.Seed(time.Now().UTC().UnixNano())
 
 	cfg := new(config.Config)
+	cfg.LocalDatabase = true
 	// Check if a configuration file was provided, and if so, load the settings
 	if err := config.AcquireConfig(args.Filepaths.Directory, args.Filepaths.ConfigFile, cfg); err == nil {
 		if args.Filepaths.Directory == "" {
@@ -131,36 +132,41 @@ func runVizCommand(clArgs []string) {
 	}
 	defer db.Close()
 
+	// Create the in-memory graph database
+	memDB, err := memGraphForScope(args.Domains.Slice(), db)
+	if err != nil {
+		r.Fprintln(color.Error, err.Error())
+		os.Exit(1)
+	}
+
 	// Get all the UUIDs for events that have information in scope
-	uuids := eventUUIDs(args.Domains.Slice(), db)
+	uuids := eventUUIDs(args.Domains.Slice(), memDB)
 	if len(uuids) == 0 {
 		r.Fprintln(color.Error, "Failed to find the domains of interest in the database")
 		os.Exit(1)
 	}
 
 	// Put the events in chronological order
-	uuids, _, _ = orderedEvents(uuids, db)
+	uuids, _, _ = orderedEvents(uuids, memDB)
 	if len(uuids) == 0 {
 		r.Fprintln(color.Error, "Failed to sort the events")
 		os.Exit(1)
 	}
 
-	selected := len(uuids) - 1
 	// Select the enumeration that the user specified
 	if args.Enum > 0 && len(uuids) > args.Enum {
-		selected = args.Enum
+		uuids = []string{uuids[args.Enum]}
 	}
-	uuids = []string{uuids[selected]}
 
-	// Create the in-memory graph database
-	memDB, err := memGraphForEvents(uuids, db)
-	if err != nil {
-		r.Fprintln(color.Error, err.Error())
-		os.Exit(1)
+	// Need to check if all the network infrastructure information is available
+	fgY.Fprintln(color.Error, "Could take a moment while acquiring AS network information")
+	// Migrate the changes back to the persistent db
+	if healASInfo(uuids, memDB) {
+		memDB.MigrateEvents(db, uuids...)
 	}
 
 	// Obtain the visualization nodes & edges from the graph
-	nodes, edges := memDB.VizData(uuids[0])
+	nodes, edges := memDB.VizData(uuids)
 
 	// Get the directory to save the files into
 	dir := args.Filepaths.Directory
@@ -175,87 +181,56 @@ func runVizCommand(clArgs []string) {
 
 	if args.Options.D3 {
 		path := filepath.Join(dir, "amass_d3.html")
-		writeD3File(path, nodes, edges)
+		err = writeGraphOutputFile("d3", path, nodes, edges)
 	}
 	if args.Options.DOT {
 		path := filepath.Join(dir, "amass.dot")
-		writeDOTData(path, nodes, edges)
+		err = writeGraphOutputFile("dot", path, nodes, edges)
 	}
 	if args.Options.GEXF {
 		path := filepath.Join(dir, "amass.gexf")
-		writeGEXFFile(path, nodes, edges)
+		err = writeGraphOutputFile("gexf", path, nodes, edges)
 	}
 	if args.Options.Graphistry {
 		path := filepath.Join(dir, "amass_graphistry.json")
-		writeGraphistryFile(path, nodes, edges)
+		err = writeGraphOutputFile("graphistry", path, nodes, edges)
 	}
 	if args.Options.Maltego {
 		path := filepath.Join(dir, "amass_maltego.csv")
-		writeMaltegoFile(path, nodes, edges)
+		err = writeGraphOutputFile("maltego", path, nodes, edges)
+	}
+
+	if err != nil {
+		r.Fprintf(color.Error, "Failed to write the output file: %v\n", err)
+		os.Exit(1)
 	}
 }
 
-func writeMaltegoFile(path string, nodes []viz.Node, edges []viz.Edge) {
+func writeGraphOutputFile(t string, path string, nodes []viz.Node, edges []viz.Edge) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
-		return
+		return err
 	}
-	defer f.Close()
+	defer func() {
+		f.Sync()
+		f.Close()
+	}()
 
 	f.Truncate(0)
 	f.Seek(0, 0)
-	viz.WriteMaltegoData(f, nodes, edges)
-	f.Sync()
-}
 
-func writeGraphistryFile(path string, nodes []viz.Node, edges []viz.Edge) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0644)
-	if err != nil {
-		return
+	switch t {
+	case "d3":
+		err = viz.WriteD3Data(f, nodes, edges)
+	case "dot":
+		err = viz.WriteDOTData(f, nodes, edges)
+	case "gexf":
+		err = viz.WriteGEXFData(f, nodes, edges)
+	case "graphistry":
+		err = viz.WriteGraphistryData(f, nodes, edges)
+	case "maltego":
+		viz.WriteMaltegoData(f, nodes, edges)
 	}
-	defer f.Close()
 
-	f.Truncate(0)
-	f.Seek(0, 0)
-	viz.WriteGraphistryData(f, nodes, edges)
-	f.Sync()
-}
-
-func writeGEXFFile(path string, nodes []viz.Node, edges []viz.Edge) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	f.Truncate(0)
-	f.Seek(0, 0)
-	viz.WriteGEXFData(f, nodes, edges)
-	f.Sync()
-}
-
-func writeD3File(path string, nodes []viz.Node, edges []viz.Edge) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	f.Truncate(0)
-	f.Seek(0, 0)
-	viz.WriteD3Data(f, nodes, edges)
-	f.Sync()
-}
-
-func writeDOTData(path string, nodes []viz.Node, edges []viz.Edge) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	f.Truncate(0)
-	f.Seek(0, 0)
-	viz.WriteDOTData(f, nodes, edges)
-	f.Sync()
+	return err
 }

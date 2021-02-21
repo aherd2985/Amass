@@ -7,43 +7,54 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
-	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/eventbus"
 	"github.com/OWASP/Amass/v3/net/http"
 	"github.com/OWASP/Amass/v3/requests"
 	"github.com/OWASP/Amass/v3/systems"
+	"github.com/caffix/eventbus"
+	"github.com/caffix/service"
 )
 
 // Pastebin is the Service that handles access to the Pastebin data source.
 type Pastebin struct {
-	requests.BaseService
+	service.BaseService
 
 	SourceType string
+	sys        systems.System
 }
 
 // NewPastebin returns he object initialized, but not yet started.
 func NewPastebin(sys systems.System) *Pastebin {
-	p := &Pastebin{SourceType: requests.API}
+	p := &Pastebin{
+		SourceType: requests.API,
+		sys:        sys,
+	}
 
-	p.BaseService = *requests.NewBaseService(p, "Pastebin")
+	p.BaseService = *service.NewBaseService(p, "Pastebin")
 	return p
+}
+
+// Description implements the Service interface.
+func (p *Pastebin) Description() string {
+	return p.SourceType
 }
 
 // OnStart implements the Service interface.
 func (p *Pastebin) OnStart() error {
-	p.BaseService.OnStart()
-
-	p.SetRateLimit(3 * time.Second)
+	p.SetRateLimit(1)
 	return nil
 }
 
-// OnDNSRequest implements the Service interface.
-func (p *Pastebin) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
-	cfg := ctx.Value(requests.ContextConfig).(*config.Config)
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if cfg == nil || bus == nil {
+// OnRequest implements the Service interface.
+func (p *Pastebin) OnRequest(ctx context.Context, args service.Args) {
+	if req, ok := args.(*requests.DNSRequest); ok {
+		p.dnsRequest(ctx, req)
+	}
+}
+
+func (p *Pastebin) dnsRequest(ctx context.Context, req *requests.DNSRequest) {
+	cfg, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
 
@@ -52,11 +63,11 @@ func (p *Pastebin) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
 		return
 	}
 
-	p.CheckRateLimit()
+	numRateLimitChecks(p, 2)
 	bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 		fmt.Sprintf("Querying %s for %s subdomains", p.String(), req.Domain))
 
-	ids, err := p.extractIDs(req.Domain)
+	ids, err := p.extractIDs(ctx, req.Domain)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 			fmt.Sprintf("%s: %s: %v", p.String(), req.Domain, err))
@@ -65,27 +76,22 @@ func (p *Pastebin) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
 
 	for _, id := range ids {
 		url := p.webURLDumpData(id)
-		page, err := http.RequestWebPage(url, nil, nil, "", "")
+		page, err := http.RequestWebPage(ctx, url, nil, nil, nil)
 		if err != nil {
 			bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %s: %v", p.String(), url, err))
 			return
 		}
 
 		for _, name := range re.FindAllString(page, -1) {
-			bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
-				Name:   name,
-				Domain: req.Domain,
-				Tag:    p.SourceType,
-				Source: p.String(),
-			})
+			genNewNameEvent(ctx, p.sys, p, name)
 		}
 	}
 }
 
 // Extract the IDs from the pastebin Web response.
-func (p *Pastebin) extractIDs(domain string) ([]string, error) {
+func (p *Pastebin) extractIDs(ctx context.Context, domain string) ([]string, error) {
 	url := p.webURLDumpIDs(domain)
-	page, err := http.RequestWebPage(url, nil, nil, "", "")
+	page, err := http.RequestWebPage(ctx, url, nil, nil, nil)
 	if err != nil {
 		return nil, err
 	}

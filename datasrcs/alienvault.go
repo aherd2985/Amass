@@ -8,26 +8,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/eventbus"
 	"github.com/OWASP/Amass/v3/net/http"
 	"github.com/OWASP/Amass/v3/requests"
-	"github.com/OWASP/Amass/v3/stringset"
 	"github.com/OWASP/Amass/v3/systems"
+	"github.com/caffix/eventbus"
+	"github.com/caffix/service"
+	"github.com/caffix/stringset"
 )
 
 // AlienVault is the Service that handles access to the AlienVault data source.
 type AlienVault struct {
-	requests.BaseService
+	service.BaseService
 
-	API        *config.APIKey
 	SourceType string
 	sys        systems.System
+	creds      *config.Credentials
 }
 
 // NewAlienVault returns he object initialized, but not yet started.
@@ -37,41 +38,47 @@ func NewAlienVault(sys systems.System) *AlienVault {
 		sys:        sys,
 	}
 
-	a.BaseService = *requests.NewBaseService(a, "AlienVault")
+	a.BaseService = *service.NewBaseService(a, "AlienVault")
 	return a
 }
 
-// Type implements the Service interface.
-func (a *AlienVault) Type() string {
+// Description implements the Service interface.
+func (a *AlienVault) Description() string {
 	return a.SourceType
 }
 
 // OnStart implements the Service interface.
 func (a *AlienVault) OnStart() error {
-	a.BaseService.OnStart()
+	a.creds = a.sys.Config().GetDataSourceConfig(a.String()).GetCredentials()
 
-	a.API = a.sys.Config().GetAPIKey(a.String())
-
-	if a.API == nil || a.API.Key == "" {
+	if a.creds == nil {
 		a.sys.Config().Log.Printf("%s: API key data was not provided", a.String())
 	}
 
-	a.SetRateLimit(100 * time.Millisecond)
+	a.SetRateLimit(1)
 	return nil
 }
 
-// OnDNSRequest implements the Service interface.
-func (a *AlienVault) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
+// OnRequest implements the Service interface.
+func (a *AlienVault) OnRequest(ctx context.Context, args service.Args) {
+	switch req := args.(type) {
+	case *requests.DNSRequest:
+		a.dnsRequest(ctx, req)
+	case *requests.WhoisRequest:
+		a.whoisRequest(ctx, req)
+	}
+}
+
+func (a *AlienVault) dnsRequest(ctx context.Context, req *requests.DNSRequest) {
 	if !a.sys.Config().IsDomainInScope(req.Domain) {
 		return
 	}
 
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if bus == nil {
+	_, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
 
-	a.CheckRateLimit()
 	bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 		fmt.Sprintf("Querying %s for %s subdomains", a.String(), req.Domain))
 	a.executeDNSQuery(ctx, req)
@@ -80,20 +87,17 @@ func (a *AlienVault) OnDNSRequest(ctx context.Context, req *requests.DNSRequest)
 	a.executeURLQuery(ctx, req)
 }
 
-// OnWhoisRequest implements the Service interface.
-func (a *AlienVault) OnWhoisRequest(ctx context.Context, req *requests.WhoisRequest) {
+func (a *AlienVault) whoisRequest(ctx context.Context, req *requests.WhoisRequest) {
 	if !a.sys.Config().IsDomainInScope(req.Domain) {
 		return
 	}
 
-	a.CheckRateLimit()
 	a.executeWhoisQuery(ctx, req)
 }
 
 func (a *AlienVault) executeDNSQuery(ctx context.Context, req *requests.DNSRequest) {
-	cfg := ctx.Value(requests.ContextConfig).(*config.Config)
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if cfg == nil || bus == nil {
+	cfg, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
 
@@ -102,10 +106,8 @@ func (a *AlienVault) executeDNSQuery(ctx context.Context, req *requests.DNSReque
 		return
 	}
 
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, a.String())
-
 	u := a.getURL(req.Domain) + "passive_dns"
-	page, err := http.RequestWebPage(u, nil, a.getHeaders(), "", "")
+	page, err := http.RequestWebPage(ctx, u, nil, a.getHeaders(), nil)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %s: %v", a.String(), u, err))
 		return
@@ -133,17 +135,14 @@ func (a *AlienVault) executeDNSQuery(ctx context.Context, req *requests.DNSReque
 
 		if re.MatchString(n) {
 			names.Insert(n)
-			ips.Insert(sub.IP)
+			if ip := net.ParseIP(sub.IP); ip != nil {
+				ips.Insert(ip.String())
+			}
 		}
 	}
 
 	for name := range names {
-		bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
-			Name:   name,
-			Domain: req.Domain,
-			Tag:    a.SourceType,
-			Source: a.String(),
-		})
+		genNewNameEvent(ctx, a.sys, a, name)
 	}
 
 	for ip := range ips {
@@ -167,9 +166,8 @@ type avURL struct {
 }
 
 func (a *AlienVault) executeURLQuery(ctx context.Context, req *requests.DNSRequest) {
-	cfg := ctx.Value(requests.ContextConfig).(*config.Config)
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if cfg == nil || bus == nil {
+	cfg, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
 
@@ -178,11 +176,9 @@ func (a *AlienVault) executeURLQuery(ctx context.Context, req *requests.DNSReque
 		return
 	}
 
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, a.String())
-
 	headers := a.getHeaders()
 	u := a.getURL(req.Domain) + "url_list"
-	page, err := http.RequestWebPage(u, nil, headers, "", "")
+	page, err := http.RequestWebPage(ctx, u, nil, headers, nil)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %s: %v", a.String(), u, err))
 		return
@@ -213,7 +209,7 @@ func (a *AlienVault) executeURLQuery(ctx context.Context, req *requests.DNSReque
 		for cur := m.PageNum + 1; cur <= pages; cur++ {
 			a.CheckRateLimit()
 			pageURL := u + "?page=" + strconv.Itoa(cur)
-			page, err = http.RequestWebPage(pageURL, nil, headers, "", "")
+			page, err = http.RequestWebPage(ctx, pageURL, nil, headers, nil)
 			if err != nil {
 				bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 					fmt.Sprintf("%s: %s: %v", a.String(), pageURL, err))
@@ -236,12 +232,7 @@ func (a *AlienVault) executeURLQuery(ctx context.Context, req *requests.DNSReque
 	}
 
 	for name := range names {
-		bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
-			Name:   name,
-			Domain: req.Domain,
-			Tag:    a.SourceType,
-			Source: a.String(),
-		})
+		genNewNameEvent(ctx, a.sys, a, name)
 	}
 
 	for ip := range ips {
@@ -260,17 +251,16 @@ func extractNamesIPs(urls []avURL, names stringset.Set, ips stringset.Set, re *r
 
 		if re.MatchString(n) {
 			names.Insert(n)
-			if u.Result.Worker.IP != "" {
-				ips.Insert(u.Result.Worker.IP)
+			if ip := net.ParseIP(u.Result.Worker.IP); ip != nil {
+				ips.Insert(ip.String())
 			}
 		}
 	}
 }
 
 func (a *AlienVault) executeWhoisQuery(ctx context.Context, req *requests.WhoisRequest) {
-	cfg := ctx.Value(requests.ContextConfig).(*config.Config)
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if cfg == nil || bus == nil {
+	cfg, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
 
@@ -280,10 +270,8 @@ func (a *AlienVault) executeWhoisQuery(ctx context.Context, req *requests.WhoisR
 	newDomains := stringset.New()
 	headers := a.getHeaders()
 	for _, email := range emails {
-		bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, a.String())
-
 		pageURL := a.getReverseWhoisURL(email)
-		page, err := http.RequestWebPage(pageURL, nil, headers, "", "")
+		page, err := http.RequestWebPage(ctx, pageURL, nil, headers, nil)
 		if err != nil {
 			bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 				fmt.Sprintf("%s: %s: %v", a.String(), pageURL, err))
@@ -326,15 +314,12 @@ func (a *AlienVault) queryWhoisForEmails(ctx context.Context, req *requests.Whoi
 	emails := stringset.New()
 	u := a.getWhoisURL(req.Domain)
 
-	cfg := ctx.Value(requests.ContextConfig).(*config.Config)
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if cfg == nil || bus == nil {
+	cfg, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return emails.Slice()
 	}
 
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, a.String())
-
-	page, err := http.RequestWebPage(u, nil, a.getHeaders(), "", "")
+	page, err := http.RequestWebPage(ctx, u, nil, a.getHeaders(), nil)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %s: %v", a.String(), u, err))
 		return emails.Slice()
@@ -379,8 +364,8 @@ func (a *AlienVault) queryWhoisForEmails(ctx context.Context, req *requests.Whoi
 func (a *AlienVault) getHeaders() map[string]string {
 	headers := map[string]string{"Content-Type": "application/json"}
 
-	if a.API != nil && a.API.Key != "" {
-		headers["X-OTX-API-KEY"] = a.API.Key
+	if a.creds != nil && a.creds.Key != "" {
+		headers["X-OTX-API-KEY"] = a.creds.Key
 	}
 	return headers
 }

@@ -7,53 +7,58 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
-	"time"
 
-	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/eventbus"
 	amasshttp "github.com/OWASP/Amass/v3/net/http"
 	"github.com/OWASP/Amass/v3/requests"
 	"github.com/OWASP/Amass/v3/systems"
+	"github.com/caffix/eventbus"
+	"github.com/caffix/service"
 )
 
 // DNSDumpster is the Service that handles access to the DNSDumpster data source.
 type DNSDumpster struct {
-	requests.BaseService
+	service.BaseService
 
 	SourceType string
+	sys        systems.System
 }
 
 // NewDNSDumpster returns he object initialized, but not yet started.
 func NewDNSDumpster(sys systems.System) *DNSDumpster {
-	d := &DNSDumpster{SourceType: requests.SCRAPE}
+	d := &DNSDumpster{
+		SourceType: requests.SCRAPE,
+		sys:        sys,
+	}
 
-	d.BaseService = *requests.NewBaseService(d, "DNSDumpster")
+	d.BaseService = *service.NewBaseService(d, "DNSDumpster")
 	return d
 }
 
-// Type implements the Service interface.
-func (d *DNSDumpster) Type() string {
+// Description implements the Service interface.
+func (d *DNSDumpster) Description() string {
 	return d.SourceType
 }
 
 // OnStart implements the Service interface.
 func (d *DNSDumpster) OnStart() error {
-	d.BaseService.OnStart()
-
-	d.SetRateLimit(time.Second)
+	d.SetRateLimit(1)
 	return nil
 }
 
-// OnDNSRequest implements the Service interface.
-func (d *DNSDumpster) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
-	cfg := ctx.Value(requests.ContextConfig).(*config.Config)
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if cfg == nil || bus == nil {
+// OnRequest implements the Service interface.
+func (d *DNSDumpster) OnRequest(ctx context.Context, args service.Args) {
+	if req, ok := args.(*requests.DNSRequest); ok {
+		d.dnsRequest(ctx, req)
+	}
+}
+
+func (d *DNSDumpster) dnsRequest(ctx context.Context, req *requests.DNSRequest) {
+	cfg, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
 
@@ -62,13 +67,11 @@ func (d *DNSDumpster) OnDNSRequest(ctx context.Context, req *requests.DNSRequest
 		return
 	}
 
-	d.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, d.String())
 	bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 		fmt.Sprintf("Querying %s for %s subdomains", d.String(), req.Domain))
 
 	u := "https://dnsdumpster.com/"
-	page, err := amasshttp.RequestWebPage(u, nil, nil, "", "")
+	page, err := amasshttp.RequestWebPage(ctx, u, nil, nil, nil)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %s: %v", d.String(), u, err))
 		return
@@ -82,8 +85,6 @@ func (d *DNSDumpster) OnDNSRequest(ctx context.Context, req *requests.DNSRequest
 	}
 
 	d.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, d.String())
-
 	page, err = d.postForm(ctx, token, req.Domain)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %s: %v", d.String(), u, err))
@@ -91,12 +92,7 @@ func (d *DNSDumpster) OnDNSRequest(ctx context.Context, req *requests.DNSRequest
 	}
 
 	for _, sd := range re.FindAllString(page, -1) {
-		bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
-			Name:   cleanName(sd),
-			Domain: req.Domain,
-			Tag:    d.SourceType,
-			Source: d.String(),
-		})
+		genNewNameEvent(ctx, d.sys, d, amasshttp.CleanName(sd))
 	}
 }
 
@@ -110,24 +106,17 @@ func (d *DNSDumpster) getCSRFToken(page string) string {
 }
 
 func (d *DNSDumpster) postForm(ctx context.Context, token, domain string) (string, error) {
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if bus == nil {
+	_, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return "", fmt.Errorf("%s failed to obtain the EventBus from Context", d.String())
 	}
 
-	dial := net.Dialer{}
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext:         dial.DialContext,
-			TLSHandshakeTimeout: 10 * time.Second,
-		},
-	}
 	params := url.Values{
 		"csrfmiddlewaretoken": {token},
 		"targetip":            {domain},
 	}
 
-	req, err := http.NewRequest("POST", "https://dnsdumpster.com/", strings.NewReader(params.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://dnsdumpster.com/", strings.NewReader(params.Encode()))
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 			fmt.Sprintf("%s: Failed to setup the POST request: %v", d.String(), err))
@@ -148,7 +137,7 @@ func (d *DNSDumpster) postForm(ctx context.Context, token, domain string) (strin
 	req.Header.Set("Referer", "https://dnsdumpster.com")
 	req.Header.Set("X-CSRF-Token", token)
 
-	resp, err := client.Do(req)
+	resp, err := amasshttp.DefaultClient.Do(req)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 			fmt.Sprintf("%s: The POST request failed: %v", d.String(), err))

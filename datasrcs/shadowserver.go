@@ -12,13 +12,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/OWASP/Amass/v3/eventbus"
 	amassnet "github.com/OWASP/Amass/v3/net"
 	amassdns "github.com/OWASP/Amass/v3/net/dns"
 	"github.com/OWASP/Amass/v3/requests"
 	"github.com/OWASP/Amass/v3/resolvers"
-	"github.com/OWASP/Amass/v3/stringset"
 	"github.com/OWASP/Amass/v3/systems"
+	"github.com/caffix/eventbus"
+	"github.com/caffix/service"
+	"github.com/caffix/stringset"
+	"github.com/miekg/dns"
 )
 
 const (
@@ -28,7 +30,7 @@ const (
 
 // ShadowServer is the Service that handles access to the ShadowServer data source.
 type ShadowServer struct {
-	requests.BaseService
+	service.BaseService
 
 	SourceType string
 	sys        systems.System
@@ -42,44 +44,43 @@ func NewShadowServer(sys systems.System) *ShadowServer {
 		sys:        sys,
 	}
 
-	s.BaseService = *requests.NewBaseService(s, "ShadowServer")
+	s.BaseService = *service.NewBaseService(s, "ShadowServer")
 	return s
 }
 
-// Type implements the Service interface.
-func (s *ShadowServer) Type() string {
+// Description implements the Service interface.
+func (s *ShadowServer) Description() string {
 	return s.SourceType
 }
 
 // OnStart implements the Service interface.
 func (s *ShadowServer) OnStart() error {
-	s.BaseService.OnStart()
-
-	if answers, _, err := s.sys.Pool().Resolve(context.TODO(),
-		ShadowServerWhoisURL, "A", resolvers.PriorityCritical); err == nil {
-		ip := answers[0].Data
-		if ip != "" {
-			s.addr = ip
+	msg := resolvers.QueryMsg(ShadowServerWhoisURL, dns.TypeA)
+	if resp, err := s.sys.Pool().Query(context.TODO(),
+		msg, resolvers.PriorityCritical, resolvers.RetryPolicy); err == nil {
+		if ans := resolvers.ExtractAnswers(resp); len(ans) > 0 {
+			ip := ans[0].Data
+			if ip != "" {
+				s.addr = ip
+			}
 		}
 	}
 
-	s.SetRateLimit(time.Second)
+	s.SetRateLimit(1)
 	return nil
 }
 
-// OnASNRequest implements the Service interface.
-func (s *ShadowServer) OnASNRequest(ctx context.Context, req *requests.ASNRequest) {
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if bus == nil {
-		return
+// OnRequest implements the Service interface.
+func (s *ShadowServer) OnRequest(ctx context.Context, args service.Args) {
+	if req, ok := args.(*requests.ASNRequest); ok {
+		s.asnRequest(ctx, req)
 	}
+}
 
+func (s *ShadowServer) asnRequest(ctx context.Context, req *requests.ASNRequest) {
 	if req.Address == "" && req.ASN == 0 {
 		return
 	}
-
-	s.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, s.String())
 
 	if req.Address != "" {
 		s.executeASNAddrQuery(ctx, req.Address)
@@ -90,8 +91,8 @@ func (s *ShadowServer) OnASNRequest(ctx context.Context, req *requests.ASNReques
 }
 
 func (s *ShadowServer) executeASNQuery(ctx context.Context, asn int) {
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if bus == nil {
+	_, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
 
@@ -101,8 +102,6 @@ func (s *ShadowServer) executeASNQuery(ctx context.Context, asn int) {
 	}
 
 	s.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, s.String())
-
 	req := s.origin(ctx, strings.Trim(blocks.Slice()[0], "/"))
 	if req == nil {
 		return
@@ -113,8 +112,8 @@ func (s *ShadowServer) executeASNQuery(ctx context.Context, asn int) {
 }
 
 func (s *ShadowServer) executeASNAddrQuery(ctx context.Context, addr string) {
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if bus == nil {
+	_, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
 
@@ -124,15 +123,13 @@ func (s *ShadowServer) executeASNAddrQuery(ctx context.Context, addr string) {
 	}
 
 	s.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, s.String())
-
 	req.Netblocks.Union(s.netblocks(ctx, req.ASN))
 	bus.Publish(requests.NewASNTopic, eventbus.PriorityHigh, req)
 }
 
 func (s *ShadowServer) origin(ctx context.Context, addr string) *requests.ASNRequest {
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if bus == nil {
+	_, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return nil
 	}
 
@@ -141,7 +138,8 @@ func (s *ShadowServer) origin(ctx context.Context, addr string) *requests.ASNReq
 	}
 	name := amassdns.ReverseIP(addr) + ".origin.asn.shadowserver.org"
 
-	answers, _, err := s.sys.Pool().Resolve(ctx, name, "TXT", resolvers.PriorityHigh)
+	msg := resolvers.QueryMsg(name, dns.TypeTXT)
+	resp, err := s.sys.Pool().Query(ctx, msg, resolvers.PriorityHigh, resolvers.RetryPolicy)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 			fmt.Sprintf("%s: %s: DNS TXT record query error: %v", s.String(), name, err),
@@ -149,7 +147,15 @@ func (s *ShadowServer) origin(ctx context.Context, addr string) *requests.ASNReq
 		return nil
 	}
 
-	fields := strings.Split(strings.Trim(answers[0].Data, "\""), " | ")
+	ans := resolvers.ExtractAnswers(resp)
+	if len(ans) == 0 {
+		bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
+			fmt.Sprintf("%s: %s: DNS TXT record query returned zero answers", s.String(), name),
+		)
+		return nil
+	}
+
+	fields := strings.Split(strings.Trim(ans[0].Data, "\""), " | ")
 	if len(fields) < 4 {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 			fmt.Sprintf("%s: %s: Failed to parse the origin response", s.String(), name),
@@ -185,20 +191,26 @@ func (s *ShadowServer) origin(ctx context.Context, addr string) *requests.ASNReq
 func (s *ShadowServer) netblocks(ctx context.Context, asn int) stringset.Set {
 	netblocks := stringset.New()
 
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if bus == nil {
+	_, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return netblocks
 	}
 
 	if s.addr == "" {
-		answers, _, err := s.sys.Pool().Resolve(ctx, ShadowServerWhoisURL, "A", resolvers.PriorityCritical)
+		msg := resolvers.QueryMsg(ShadowServerWhoisURL, dns.TypeA)
+		resp, err := s.sys.Pool().Query(ctx, msg, resolvers.PriorityCritical, resolvers.RetryPolicy)
 		if err != nil {
 			bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 				fmt.Sprintf("%s: %s: %v", s.String(), ShadowServerWhoisURL, err))
 			return netblocks
 		}
 
-		ip := answers[0].Data
+		ans := resolvers.ExtractAnswers(resp)
+		if len(ans) == 0 {
+			return netblocks
+		}
+
+		ip := ans[0].Data
 		if ip == "" {
 			bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 				fmt.Sprintf("%s: Failed to resolve %s", s.String(), ShadowServerWhoisURL),
@@ -211,8 +223,7 @@ func (s *ShadowServer) netblocks(ctx context.Context, asn int) stringset.Set {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	d := net.Dialer{}
-	conn, err := d.DialContext(ctx, "tcp", s.addr+":43")
+	conn, err := amassnet.DialContext(ctx, "tcp", s.addr+":43")
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %v", s.String(), err))
 		return netblocks

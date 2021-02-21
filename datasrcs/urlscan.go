@@ -6,25 +6,26 @@ package datasrcs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/eventbus"
 	"github.com/OWASP/Amass/v3/net/http"
 	"github.com/OWASP/Amass/v3/requests"
-	"github.com/OWASP/Amass/v3/stringset"
 	"github.com/OWASP/Amass/v3/systems"
+	"github.com/caffix/eventbus"
+	"github.com/caffix/service"
+	"github.com/caffix/stringset"
 )
 
 // URLScan is the Service that handles access to the URLScan data source.
 type URLScan struct {
-	requests.BaseService
+	service.BaseService
 
-	API        *config.APIKey
 	SourceType string
 	sys        systems.System
+	creds      *config.Credentials
 }
 
 // NewURLScan returns he object initialized, but not yet started.
@@ -34,33 +35,37 @@ func NewURLScan(sys systems.System) *URLScan {
 		sys:        sys,
 	}
 
-	u.BaseService = *requests.NewBaseService(u, "URLScan")
+	u.BaseService = *service.NewBaseService(u, "URLScan")
 	return u
 }
 
-// Type implements the Service interface.
-func (u *URLScan) Type() string {
+// Description implements the Service interface.
+func (u *URLScan) Description() string {
 	return u.SourceType
 }
 
 // OnStart implements the Service interface.
 func (u *URLScan) OnStart() error {
-	u.BaseService.OnStart()
+	u.creds = u.sys.Config().GetDataSourceConfig(u.String()).GetCredentials()
 
-	u.API = u.sys.Config().GetAPIKey(u.String())
-	if u.API == nil || u.API.Key == "" {
+	if u.creds == nil || u.creds.Key == "" {
 		u.sys.Config().Log.Printf("%s: API key data was not provided", u.String())
 	}
 
-	u.SetRateLimit(2 * time.Second)
+	u.SetRateLimit(1)
 	return nil
 }
 
-// OnDNSRequest implements the Service interface.
-func (u *URLScan) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
-	cfg := ctx.Value(requests.ContextConfig).(*config.Config)
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if cfg == nil || bus == nil {
+// OnRequest implements the Service interface.
+func (u *URLScan) OnRequest(ctx context.Context, args service.Args) {
+	if req, ok := args.(*requests.DNSRequest); ok {
+		u.dnsRequest(ctx, req)
+	}
+}
+
+func (u *URLScan) dnsRequest(ctx context.Context, req *requests.DNSRequest) {
+	cfg, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
 
@@ -69,13 +74,12 @@ func (u *URLScan) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
 		return
 	}
 
-	u.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, u.String())
+	numRateLimitChecks(u, 1)
 	bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 		fmt.Sprintf("Querying %s for %s subdomains", u.String(), req.Domain))
 
 	url := u.searchURL(req.Domain)
-	page, err := http.RequestWebPage(url, nil, nil, "", "")
+	page, err := http.RequestWebPage(ctx, url, nil, nil, nil)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %s: %v", u.String(), url, err))
 		return
@@ -104,37 +108,35 @@ func (u *URLScan) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
 
 	subs := stringset.New()
 	for _, id := range ids {
-		subs.Union(u.getSubsFromResult(ctx, id))
+		set, err := u.getSubsFromResult(ctx, id)
+		if err != nil {
+			break
+		}
+
+		subs.Union(set)
 	}
 
 	for name := range subs {
 		if re.MatchString(name) {
-			bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
-				Name:   name,
-				Domain: req.Domain,
-				Tag:    u.SourceType,
-				Source: u.String(),
-			})
+			genNewNameEvent(ctx, u.sys, u, name)
 		}
 	}
 }
 
-func (u *URLScan) getSubsFromResult(ctx context.Context, id string) stringset.Set {
+func (u *URLScan) getSubsFromResult(ctx context.Context, id string) (stringset.Set, error) {
 	subs := stringset.New()
 
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if bus == nil {
-		return subs
+	_, bus, err := ContextConfigBus(ctx)
+	if err != nil {
+		return subs, errors.New("Failed to access the event bus")
 	}
 
-	u.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, u.String())
-
+	numRateLimitChecks(u, 2)
 	url := u.resultURL(id)
-	page, err := http.RequestWebPage(url, nil, nil, "", "")
+	page, err := http.RequestWebPage(ctx, url, nil, nil, nil)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %s: %v", u.String(), url, err))
-		return subs
+		return subs, errors.New("HTTP request failed")
 	}
 	// Extract the subdomain names from the REST API results
 	var data struct {
@@ -146,29 +148,28 @@ func (u *URLScan) getSubsFromResult(ctx context.Context, id string) stringset.Se
 	if err := json.Unmarshal([]byte(page), &data); err == nil {
 		subs.InsertMany(data.Lists.Subdomains...)
 	}
-	return subs
+	return subs, nil
 }
 
 func (u *URLScan) attemptSubmission(ctx context.Context, domain string) string {
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if bus == nil {
+	_, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return ""
 	}
 
-	if u.API == nil || u.API.Key == "" {
+	if u.creds == nil || u.creds.Key == "" {
 		return ""
 	}
 
-	u.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, u.String())
+	numRateLimitChecks(u, 2)
 
 	headers := map[string]string{
-		"API-Key":      u.API.Key,
+		"API-Key":      u.creds.Key,
 		"Content-Type": "application/json",
 	}
 	url := "https://urlscan.io/api/v1/scan/"
 	body := strings.NewReader(u.submitBody(domain))
-	page, err := http.RequestWebPage(url, body, headers, "", "")
+	page, err := http.RequestWebPage(ctx, url, body, headers, nil)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %s: %v", u.String(), url, err))
 		return ""
@@ -189,13 +190,12 @@ func (u *URLScan) attemptSubmission(ctx context.Context, domain string) string {
 
 	// Keep this data source active while waiting for the scan to complete
 	for {
-		_, err = http.RequestWebPage(result.API, nil, nil, "", "")
+		_, err = http.RequestWebPage(ctx, result.API, nil, nil, nil)
 		if err == nil || err.Error() != "404 Not Found" {
 			break
 		}
 
-		u.CheckRateLimit()
-		bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, u.String())
+		numRateLimitChecks(u, 2)
 	}
 	return result.ID
 }

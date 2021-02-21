@@ -7,7 +7,7 @@ name = "HackerTarget"
 type = "api"
 
 function start()
-    setratelimit(2)
+    setratelimit(1)
 end
 
 function vertical(ctx, domain)
@@ -18,23 +18,28 @@ function buildurl(domain)
     return "http://api.hackertarget.com/hostsearch/?q=" .. domain
 end
 
-function asn(ctx, addr)
+function asn(ctx, addr, asn)
+    if addr == "" then
+        return
+    end
+
     local resp
     local aurl = asnurl(addr)
+    local cfg = datasrc_config()
     -- Check if the response data is in the graph database
-    if (api and api.ttl ~= nil and api.ttl > 0) then
-        resp = obtain_response(aurl, api.ttl)
+    if (cfg and cfg.ttl ~= nil and cfg.ttl > 0) then
+        resp = obtain_response(aurl, cfg.ttl)
     end
 
     if (resp == nil or resp == "") then
         local err
 
-        resp, err = request({url=aurl})
+        resp, err = request(ctx, {url=aurl})
         if (err ~= nil and err ~= "") then
             return
         end
 
-        if (api and api.ttl ~= nil and api.ttl > 0) then
+        if (cfg and cfg.ttl ~= nil and cfg.ttl > 0) then
             cache_response(aurl, resp)
         end
     end

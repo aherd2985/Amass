@@ -7,24 +7,25 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/eventbus"
 	"github.com/OWASP/Amass/v3/net/http"
 	"github.com/OWASP/Amass/v3/requests"
 	"github.com/OWASP/Amass/v3/systems"
+	"github.com/caffix/eventbus"
+	"github.com/caffix/service"
 )
 
 // WhoisXML is the Service that handles access to the WhoisXML data source.
 type WhoisXML struct {
-	requests.BaseService
+	service.BaseService
 
-	API        *config.APIKey
 	SourceType string
 	sys        systems.System
+	creds      *config.Credentials
 }
 
 // WhoisXMLResponse handles WhoisXML response json.
@@ -65,46 +66,65 @@ func NewWhoisXML(sys systems.System) *WhoisXML {
 		sys:        sys,
 	}
 
-	w.BaseService = *requests.NewBaseService(w, "WhoisXML")
+	w.BaseService = *service.NewBaseService(w, "WhoisXML")
 	return w
+}
+
+// Description implements the Service interface.
+func (w *WhoisXML) Description() string {
+	return w.SourceType
 }
 
 // OnStart implements the Service interface.
 func (w *WhoisXML) OnStart() error {
-	w.BaseService.OnStart()
+	w.creds = w.sys.Config().GetDataSourceConfig(w.String()).GetCredentials()
 
-	w.API = w.sys.Config().GetAPIKey(w.String())
-	if w.API == nil || w.API.Key == "" {
+	if w.creds == nil || w.creds.Key == "" {
 		w.sys.Config().Log.Printf("%s: API key data was not provided", w.String())
 	}
 
-	w.SetRateLimit(10 * time.Second)
+	w.SetRateLimit(1)
+	return w.checkConfig()
+}
+
+// CheckConfig implements the Service interface.
+func (w *WhoisXML) checkConfig() error {
+	creds := w.sys.Config().GetDataSourceConfig(w.String()).GetCredentials()
+
+	if creds == nil || creds.Key == "" {
+		estr := fmt.Sprintf("%s: check callback failed for the configuration", w.String())
+		w.sys.Config().Log.Print(estr)
+		return errors.New(estr)
+	}
+
 	return nil
 }
 
-// OnWhoisRequest implements the Service interface.
-func (w *WhoisXML) OnWhoisRequest(ctx context.Context, req *requests.WhoisRequest) {
-	cfg := ctx.Value(requests.ContextConfig).(*config.Config)
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if cfg == nil || bus == nil {
+// OnRequest implements the Service interface.
+func (w *WhoisXML) OnRequest(ctx context.Context, args service.Args) {
+	if req, ok := args.(*requests.WhoisRequest); ok {
+		w.whoisRequest(ctx, req)
+	}
+}
+
+func (w *WhoisXML) whoisRequest(ctx context.Context, req *requests.WhoisRequest) {
+	cfg, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
-
-	if w.API == nil || w.API.Key == "" {
+	if w.creds == nil || w.creds.Key == "" {
 		return
 	}
-
 	if !cfg.IsDomainInScope(req.Domain) {
 		return
 	}
+
 	bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 		fmt.Sprintf("Querying %s for %s subdomains", w.String(), req.Domain))
 
-	w.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, w.String())
-
+	numRateLimitChecks(w, 9)
 	u := w.getReverseWhoisURL(req.Domain)
-	headers := map[string]string{"X-Authentication-Token": w.API.Key}
+	headers := map[string]string{"X-Authentication-Token": w.creds.Key}
 
 	var r = WhoisXMLBasicRequest{
 		Search: "historic",
@@ -113,7 +133,7 @@ func (w *WhoisXML) OnWhoisRequest(ctx context.Context, req *requests.WhoisReques
 	r.SearchTerms.Include = append(r.SearchTerms.Include, req.Domain)
 	jr, _ := json.Marshal(r)
 
-	page, err := http.RequestWebPage(u, bytes.NewReader(jr), headers, "", "")
+	page, err := http.RequestWebPage(ctx, u, bytes.NewReader(jr), headers, nil)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %s: %v", w.String(), u, err))
 		return
@@ -139,5 +159,5 @@ func (w *WhoisXML) OnWhoisRequest(ctx context.Context, req *requests.WhoisReques
 }
 
 func (w *WhoisXML) getReverseWhoisURL(domain string) string {
-	return fmt.Sprint("https://reverse-whois-api.whoisxmlapi.com/api/v2")
+	return "https://reverse-whois-api.whoisxmlapi.com/api/v2"
 }

@@ -8,18 +8,32 @@ import (
 	"sync"
 
 	"github.com/OWASP/Amass/v3/requests"
-	"github.com/OWASP/Amass/v3/stringset"
+	"github.com/caffix/stringset"
+	"github.com/yl2chen/cidranger"
 )
 
 // ASNCache builds a cache of ASN and netblock information.
 type ASNCache struct {
 	sync.RWMutex
-	cache map[int]*requests.ASNRequest
+	cache  map[int]*requests.ASNRequest
+	ranger cidranger.Ranger
+}
+
+type cacheRangerEntry struct {
+	IPNet net.IPNet
+	Data  *requests.ASNRequest
+}
+
+func (e *cacheRangerEntry) Network() net.IPNet {
+	return e.IPNet
 }
 
 // NewASNCache returns an empty ASNCache for saving and search ASN and netblock information.
 func NewASNCache() *ASNCache {
-	return &ASNCache{cache: make(map[int]*requests.ASNRequest)}
+	return &ASNCache{
+		cache:  make(map[int]*requests.ASNRequest),
+		ranger: cidranger.NewPCTrieRanger(),
+	}
 }
 
 // Update uses the saves the information in ASNRequest into the ASNCache.
@@ -59,10 +73,21 @@ func (c *ASNCache) Update(req *requests.ASNRequest) {
 	}
 }
 
+// ASNSearch return the cached ASN / netblock info associated with the provided asn parameter,
+// or nil when not found in the cache.
+func (c *ASNCache) ASNSearch(asn int) *requests.ASNRequest {
+	return c.cache[asn]
+}
+
 // AddrSearch returns the cached ASN / netblock info that the addr parameter belongs in,
 // or nil when not found in the cache.
 func (c *ASNCache) AddrSearch(addr string) *requests.ASNRequest {
-	// Does the address fall into a reserved address range?
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return nil
+	}
+
+	// Does the address fall into a reserved address ranges?
 	if yes, cidr := IsReservedAddress(addr); yes {
 		return &requests.ASNRequest{
 			Address:     addr,
@@ -74,17 +99,56 @@ func (c *ASNCache) AddrSearch(addr string) *requests.ASNRequest {
 		}
 	}
 
+	entry := c.searchRangerData(ip)
+	if entry == nil {
+		c.rawData2Ranger(ip)
+
+		entry = c.searchRangerData(ip)
+		if entry == nil {
+			return nil
+		}
+	}
+
+	return &requests.ASNRequest{
+		Address:     addr,
+		ASN:         entry.Data.ASN,
+		CC:          entry.Data.CC,
+		Prefix:      entry.IPNet.String(),
+		Netblocks:   stringset.New(entry.IPNet.String()),
+		Description: entry.Data.Description,
+		Tag:         requests.RIR,
+		Source:      "RIR",
+	}
+}
+
+func (c *ASNCache) searchRangerData(ip net.IP) *cacheRangerEntry {
 	c.RLock()
 	defer c.RUnlock()
 
-	var a int
+	if entries, err := c.ranger.ContainingNetworks(ip); err == nil {
+		for _, e := range entries {
+			if entry, ok := e.(*cacheRangerEntry); ok {
+				return entry
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *ASNCache) rawData2Ranger(ip net.IP) {
+	c.Lock()
+	defer c.Unlock()
+
 	var cidr *net.IPNet
-	var desc string
-	ip := net.ParseIP(addr)
-	for asn, record := range c.cache {
+	var data *requests.ASNRequest
+	for _, record := range c.cache {
 		for netblock := range record.Netblocks {
 			_, ipnet, err := net.ParseCIDR(netblock)
 			if err != nil {
+				continue
+			}
+			if ones, _ := ipnet.Mask.Size(); ones == 0 {
 				continue
 			}
 
@@ -93,22 +157,17 @@ func (c *ASNCache) AddrSearch(addr string) *requests.ASNRequest {
 				if cidr != nil && compareCIDRSizes(cidr, ipnet) == 1 {
 					continue
 				}
-				a = asn
+				data = record
 				cidr = ipnet
-				desc = record.Description
 			}
 		}
 	}
-	if cidr == nil {
-		return nil
-	}
-	return &requests.ASNRequest{
-		Address:     addr,
-		ASN:         a,
-		Prefix:      cidr.String(),
-		Description: desc,
-		Tag:         requests.RIR,
-		Source:      "RIR",
+
+	if cidr != nil {
+		_ = c.ranger.Insert(&cacheRangerEntry{
+			IPNet: *cidr,
+			Data:  data,
+		})
 	}
 }
 

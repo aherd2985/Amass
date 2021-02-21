@@ -11,20 +11,19 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"time"
 
-	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/eventbus"
 	amassnet "github.com/OWASP/Amass/v3/net"
 	"github.com/OWASP/Amass/v3/net/http"
 	"github.com/OWASP/Amass/v3/requests"
-	"github.com/OWASP/Amass/v3/stringset"
 	"github.com/OWASP/Amass/v3/systems"
+	"github.com/caffix/eventbus"
+	"github.com/caffix/service"
+	"github.com/caffix/stringset"
 )
 
 // Robtex is the Service that handles access to the Robtex data source.
 type Robtex struct {
-	requests.BaseService
+	service.BaseService
 
 	SourceType string
 	sys        systems.System
@@ -43,37 +42,37 @@ func NewRobtex(sys systems.System) *Robtex {
 		sys:        sys,
 	}
 
-	r.BaseService = *requests.NewBaseService(r, "Robtex")
+	r.BaseService = *service.NewBaseService(r, "Robtex")
 	return r
 }
 
-// Type implements the Service interface.
-func (r *Robtex) Type() string {
+// Description implements the Service interface.
+func (r *Robtex) Description() string {
 	return r.SourceType
 }
 
 // OnStart implements the Service interface.
 func (r *Robtex) OnStart() error {
-	r.BaseService.OnStart()
-
-	r.SetRateLimit(6 * time.Second)
+	r.SetRateLimit(1)
 	return nil
 }
 
-// OnASNRequest implements the Service interface.
-func (r *Robtex) OnASNRequest(ctx context.Context, req *requests.ASNRequest) {
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if bus == nil {
-		return
+// OnRequest implements the Service interface.
+func (r *Robtex) OnRequest(ctx context.Context, args service.Args) {
+	switch req := args.(type) {
+	case *requests.DNSRequest:
+		r.dnsRequest(ctx, req)
+	case *requests.ASNRequest:
+		r.asnRequest(ctx, req)
 	}
+}
 
+func (r *Robtex) asnRequest(ctx context.Context, req *requests.ASNRequest) {
 	if req.Address == "" && req.ASN == 0 {
 		return
 	}
 
-	r.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, r.String())
-
+	numRateLimitChecks(r, 5)
 	if req.Address != "" {
 		r.executeASNAddrQuery(ctx, req.Address)
 		return
@@ -82,11 +81,9 @@ func (r *Robtex) OnASNRequest(ctx context.Context, req *requests.ASNRequest) {
 	r.executeASNQuery(ctx, req.ASN)
 }
 
-// OnDNSRequest implements the Service interface.
-func (r *Robtex) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
-	cfg := ctx.Value(requests.ContextConfig).(*config.Config)
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if cfg == nil || bus == nil {
+func (r *Robtex) dnsRequest(ctx context.Context, req *requests.DNSRequest) {
+	cfg, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
 
@@ -95,13 +92,12 @@ func (r *Robtex) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
 		return
 	}
 
-	r.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, r.String())
+	numRateLimitChecks(r, 5)
 	bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 		fmt.Sprintf("Querying %s for %s subdomains", r.String(), req.Domain))
 
 	url := "https://freeapi.robtex.com/pdns/forward/" + req.Domain
-	page, err := http.RequestWebPage(url, nil, nil, "", "")
+	page, err := http.RequestWebPage(ctx, url, nil, nil, nil)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %s: %v", r.String(), url, err))
 		return
@@ -115,12 +111,7 @@ func (r *Robtex) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
 			name := strings.Trim(line.Data, ".")
 
 			if cfg.IsDomainInScope(name) {
-				bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
-					Name:   name,
-					Domain: req.Domain,
-					Tag:    r.Type(),
-					Source: r.String(),
-				})
+				genNewNameEvent(ctx, r.sys, r, name)
 			}
 		}
 	}
@@ -128,14 +119,12 @@ func (r *Robtex) OnDNSRequest(ctx context.Context, req *requests.DNSRequest) {
 loop:
 	for ip := range ips {
 		select {
-		case <-r.Quit():
+		case <-r.Done():
 			return
 		default:
-			r.CheckRateLimit()
-			bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, r.String())
-
+			numRateLimitChecks(r, 6)
 			url = "https://freeapi.robtex.com/pdns/reverse/" + ip
-			pdns, err := http.RequestWebPage(url, nil, nil, "", "")
+			pdns, err := http.RequestWebPage(ctx, url, nil, nil, nil)
 			if err != nil {
 				bus.Publish(requests.LogTopic, eventbus.PriorityHigh,
 					fmt.Sprintf("%s: %s: %v", r.String(), url, err))
@@ -145,14 +134,7 @@ loop:
 			for _, line := range r.parseDNSJSON(pdns) {
 				name := strings.Trim(line.Name, ".")
 
-				if domain := cfg.WhichDomain(name); domain != "" {
-					bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
-						Name:   name,
-						Domain: domain,
-						Tag:    r.Type(),
-						Source: r.String(),
-					})
-				}
+				genNewNameEvent(ctx, r.sys, r, name)
 			}
 		}
 	}
@@ -180,9 +162,8 @@ func (r *Robtex) parseDNSJSON(page string) []robtexJSON {
 }
 
 func (r *Robtex) executeASNQuery(ctx context.Context, asn int) {
-	cfg := ctx.Value(requests.ContextConfig).(*config.Config)
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if cfg == nil || bus == nil {
+	_, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
 
@@ -196,9 +177,7 @@ func (r *Robtex) executeASNQuery(ctx context.Context, asn int) {
 		return
 	}
 
-	r.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, r.String())
-
+	numRateLimitChecks(r, 6)
 	req := r.origin(ctx, ipnet.IP.String())
 	if req == nil {
 		return
@@ -209,9 +188,8 @@ func (r *Robtex) executeASNQuery(ctx context.Context, asn int) {
 }
 
 func (r *Robtex) executeASNAddrQuery(ctx context.Context, addr string) {
-	cfg := ctx.Value(requests.ContextConfig).(*config.Config)
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if cfg == nil || bus == nil {
+	_, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return
 	}
 
@@ -225,9 +203,8 @@ func (r *Robtex) executeASNAddrQuery(ctx context.Context, addr string) {
 }
 
 func (r *Robtex) origin(ctx context.Context, addr string) *requests.ASNRequest {
-	cfg := ctx.Value(requests.ContextConfig).(*config.Config)
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if cfg == nil || bus == nil {
+	_, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return nil
 	}
 
@@ -235,11 +212,9 @@ func (r *Robtex) origin(ctx context.Context, addr string) *requests.ASNRequest {
 		return nil
 	}
 
-	r.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, r.String())
-
+	numRateLimitChecks(r, 6)
 	url := "https://freeapi.robtex.com/ipquery/" + addr
-	page, err := http.RequestWebPage(url, nil, nil, "", "")
+	page, err := http.RequestWebPage(ctx, url, nil, nil, nil)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %s: %v", r.String(), url, err))
 		return nil
@@ -270,47 +245,19 @@ func (r *Robtex) origin(ctx context.Context, addr string) *requests.ASNRequest {
 	}
 
 	for _, n := range ipinfo.ActiveDNS {
-		if cfg.IsDomainInScope(n.Name) {
-			bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
-				Name:   n.Name,
-				Domain: r.sys.Pool().SubdomainToDomain(n.Name),
-				Tag:    r.Type(),
-				Source: r.String(),
-			})
-		}
+		genNewNameEvent(ctx, r.sys, r, n.Name)
 	}
 
 	for _, n := range ipinfo.ActiveDNSHistory {
-		if cfg.IsDomainInScope(n.Name) {
-			bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
-				Name:   n.Name,
-				Domain: r.sys.Pool().SubdomainToDomain(n.Name),
-				Tag:    r.Type(),
-				Source: r.String(),
-			})
-		}
+		genNewNameEvent(ctx, r.sys, r, n.Name)
 	}
 
 	for _, n := range ipinfo.PassiveDNS {
-		if cfg.IsDomainInScope(n.Name) {
-			bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
-				Name:   n.Name,
-				Domain: r.sys.Pool().SubdomainToDomain(n.Name),
-				Tag:    r.Type(),
-				Source: r.String(),
-			})
-		}
+		genNewNameEvent(ctx, r.sys, r, n.Name)
 	}
 
 	for _, n := range ipinfo.PassiveDNSHistory {
-		if cfg.IsDomainInScope(n.Name) {
-			bus.Publish(requests.NewNameTopic, eventbus.PriorityHigh, &requests.DNSRequest{
-				Name:   n.Name,
-				Domain: r.sys.Pool().SubdomainToDomain(n.Name),
-				Tag:    r.Type(),
-				Source: r.String(),
-			})
-		}
+		genNewNameEvent(ctx, r.sys, r, n.Name)
 	}
 
 	if ipinfo.ASN == 0 {
@@ -334,7 +281,7 @@ func (r *Robtex) origin(ctx context.Context, addr string) *requests.ASNRequest {
 		Prefix:      ipinfo.Prefix,
 		Description: desc,
 		Netblocks:   stringset.New(ipinfo.Prefix),
-		Tag:         r.Type(),
+		Tag:         r.SourceType,
 		Source:      r.String(),
 	}
 }
@@ -342,16 +289,14 @@ func (r *Robtex) origin(ctx context.Context, addr string) *requests.ASNRequest {
 func (r *Robtex) netblocks(ctx context.Context, asn int) stringset.Set {
 	netblocks := stringset.New()
 
-	bus := ctx.Value(requests.ContextEventBus).(*eventbus.EventBus)
-	if bus == nil {
+	_, bus, err := ContextConfigBus(ctx)
+	if err != nil {
 		return netblocks
 	}
 
-	r.CheckRateLimit()
-	bus.Publish(requests.SetActiveTopic, eventbus.PriorityCritical, r.String())
-
+	numRateLimitChecks(r, 6)
 	url := "https://freeapi.robtex.com/asquery/" + strconv.Itoa(asn)
-	page, err := http.RequestWebPage(url, nil, nil, "", "")
+	page, err := http.RequestWebPage(ctx, url, nil, nil, nil)
 	if err != nil {
 		bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("%s: %s: %v", r.String(), url, err))
 		return netblocks

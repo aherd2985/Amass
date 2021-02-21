@@ -11,7 +11,7 @@ function start()
 end
 
 function vertical(ctx, domain)
-    local page, err = request({
+    local page, err = request(ctx, {
         url=buildurl(domain),
         headers={['Content-Type']="application/json"},
     })
@@ -39,7 +39,11 @@ function sendnames(ctx, content)
         return
     end
 
+    local found = {}
     for i, v in pairs(names) do
-        newname(ctx, v)
+        if found[v] == nil then
+            newname(ctx, v)
+            found[v] = true
+        end
     end
 end

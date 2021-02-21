@@ -10,24 +10,44 @@ function start()
     setratelimit(20)
 end
 
+function check()
+    local c
+    local cfg = datasrc_config()
+    if cfg ~= nil then
+        c = cfg.credentials
+    end
+
+    if (c ~= nil and c.key ~= nil and 
+        c.secret ~= nil and c.key ~= "" and c.secret ~= "") then
+        return true
+    end
+    return false
+end
+
 function vertical(ctx, domain)
-    if (api == nil or api.key == "" or api.secret == "") then
+    local c
+    local cfg = datasrc_config()
+    if cfg ~= nil then
+        c = cfg.credentials
+    end
+
+    if (c == nil or c.key == nil or 
+        c.secret == nil or c.key == "" or c.secret == "") then
         return
     end
 
     local dec
     local resp
-    local cacheurl = queryurl_notoken(domain)
     -- Check if the response data is in the graph database
-    if (api.ttl ~= nil and api.ttl > 0) then
-        resp = obtain_response(cacheurl, api.ttl)
+    if (cfg.ttl ~= nil and cfg.ttl > 0) then
+        resp = obtain_response(domain, cfg.ttl)
     end
 
     if (resp == nil or resp == "") then
         local err
 
-        resp, err = request({
-            url=authurl(api.key, api.secret),
+        resp, err = request(ctx, {
+            url=authurl(c.key, c.secret),
             headers={['Content-Type']="application/json"},
         })
         if (err ~= nil and err ~= "") then
@@ -39,7 +59,7 @@ function vertical(ctx, domain)
             return
         end
     
-        resp, err = request({
+        resp, err = request(ctx, {
             url=queryurl(domain, dec.access_token),
             headers={['Content-Type']="application/json"},
         })
@@ -47,8 +67,8 @@ function vertical(ctx, domain)
             return
         end
 
-        if (api.ttl ~= nil and api.ttl > 0) then
-            cache_response(cacheurl, resp)
+        if (cfg.ttl ~= nil and cfg.ttl > 0) then
+            cache_response(domain, resp)
         end
     end
 
@@ -72,17 +92,17 @@ function queryurl(domain, token)
     return "https://graph.facebook.com/certificates?fields=domains&access_token=" .. token .. "&query=*." .. domain
 end
 
-function queryurl_notoken(domain)
-    return "https://graph.facebook.com/certificates?fields=domains&query=*." .. domain
-end
-
 function sendnames(ctx, content)
     local names = find(content, subdomainre)
     if names == nil then
         return
     end
 
+    local found = {}
     for i, v in pairs(names) do
-        newname(ctx, v)
+        if found[v] == nil then
+            newname(ctx, v)
+            found[v] = true
+        end
     end
 end

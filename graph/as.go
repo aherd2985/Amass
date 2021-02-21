@@ -4,15 +4,15 @@
 package graph
 
 import (
+	"net"
 	"strconv"
 
-	"github.com/OWASP/Amass/v3/graphdb"
-	"github.com/OWASP/Amass/v3/net"
+	amassnet "github.com/OWASP/Amass/v3/net"
 	"github.com/OWASP/Amass/v3/requests"
 )
 
 // InsertAS adds/updates an autonomous system in the graph.
-func (g *Graph) InsertAS(asn, desc, source, tag, eventID string) (graphdb.Node, error) {
+func (g *Graph) InsertAS(asn, desc, source, tag, eventID string) (Node, error) {
 	asNode, err := g.InsertNodeIfNotExist(asn, "as")
 	if err != nil {
 		return asNode, err
@@ -23,8 +23,9 @@ func (g *Graph) InsertAS(asn, desc, source, tag, eventID string) (graphdb.Node, 
 	if err == nil && len(p) > 0 {
 		if p[0].Value != desc {
 			// Update the 'desc' property
-			g.db.DeleteProperty(asNode, p[0].Predicate, p[0].Value)
-			insert = true
+			if err := g.db.DeleteProperty(asNode, p[0].Predicate, p[0].Value); err == nil {
+				insert = true
+			}
 		}
 	} else {
 		// The description was not found
@@ -57,7 +58,7 @@ func (g *Graph) InsertInfrastructure(asn int, desc, addr, cidr, source, tag, eve
 	}
 
 	// Create the edge between the CIDR and the address
-	containsEdge := &graphdb.Edge{
+	containsEdge := &Edge{
 		Predicate: "contains",
 		From:      cidrNode,
 		To:        ipNode,
@@ -72,7 +73,7 @@ func (g *Graph) InsertInfrastructure(asn int, desc, addr, cidr, source, tag, eve
 	}
 
 	// Create the edge between the AS and the netblock
-	prefixEdge := &graphdb.Edge{
+	prefixEdge := &Edge{
 		Predicate: "prefix",
 		From:      asNode,
 		To:        cidrNode,
@@ -90,7 +91,7 @@ func (g *Graph) ReadASDescription(asn string) string {
 	return ""
 }
 
-func (g *Graph) nodeDescription(node graphdb.Node) string {
+func (g *Graph) nodeDescription(node Node) string {
 	if p, err := g.db.ReadProperties(node, "description"); err == nil && len(p) > 0 {
 		return p[0].Value
 	}
@@ -98,7 +99,8 @@ func (g *Graph) nodeDescription(node graphdb.Node) string {
 	return ""
 }
 
-func (g *Graph) asnCacheFill(cache *net.ASNCache) error {
+// ASNCacheFill populates an ASNCache object with the AS data in the receiver object.
+func (g *Graph) ASNCacheFill(cache *amassnet.ASNCache) error {
 	nodes, err := g.AllNodesOfType("as")
 	if err != nil {
 		return err
@@ -107,7 +109,14 @@ func (g *Graph) asnCacheFill(cache *net.ASNCache) error {
 	for _, as := range nodes {
 		id := g.db.NodeToID(as)
 		asn, _ := strconv.Atoi(id)
+		if asn <= 0 {
+			continue
+		}
+
 		desc := g.nodeDescription(as)
+		if g.alreadyClosed {
+			return nil
+		}
 
 		edges, err := g.db.ReadOutEdges(as, "prefix")
 		if err != nil {
@@ -115,15 +124,21 @@ func (g *Graph) asnCacheFill(cache *net.ASNCache) error {
 		}
 
 		for _, edge := range edges {
-			cidr := g.db.NodeToID(edge.To)
+			if g.alreadyClosed {
+				return nil
+			}
 
-			cache.Update(&requests.ASNRequest{
-				ASN:         asn,
-				Prefix:      cidr,
-				Description: desc,
-			})
+			if _, cidr, err := net.ParseCIDR(g.db.NodeToID(edge.To)); err == nil {
+				cache.Update(&requests.ASNRequest{
+					Address:     cidr.IP.String(),
+					ASN:         asn,
+					Prefix:      cidr.String(),
+					Description: desc,
+					Tag:         requests.RIR,
+					Source:      g.String(),
+				})
+			}
 		}
 	}
-
 	return nil
 }
